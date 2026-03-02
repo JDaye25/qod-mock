@@ -1,0 +1,27 @@
+{
+  "prev_hash": "8c686f8bdf40a509fa72f8bc2781f69f99b46071543410e141db460fd4c1e01d",
+  "this_hash": "27e4cdb50f1c946c2a52a329205e1fcf892b8c0169729d432805d0e71b6ca04b",
+  "proof": {
+    "session_id": "1e589da0-f0f9-4177-86cc-4fd118b3fa00",
+    "requested": {
+      "intent": {
+        "target_p95_latency_ms": 80,
+        "target_jitter_ms": 10,
+        "duration_s": 60,
+        "flow_label": "demo-flow"
+      },
+      "qos_profile": "QOS_BALANCED"
+    },
+    "provider_observed": {
+      "qos_status_at_finalize": "AVAILABLE",
+      "provider_note": "local-simulated-provider"
+    },
+    "measured_outcomes": {
+      "samples_count": 1,
+      "avg_p50_ms": 0.0,
+      "avg_p95_ms": 0.0,
+      "avg_jitter_ms": 0.0
+    },
+    "created_at": 1772438989.8712153
+  }
+}

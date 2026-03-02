@@ -1,0 +1,75 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>QoD Mock Portal</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; }
+code, pre { background: #f6f6f6; padding: 0.25rem 0.4rem; }
+pre { padding: 1rem; overflow:auto; }
+button { margin-right: 0.5rem; }
+.row { display:flex; gap:1rem; align-items:flex-start; }
+.col { flex:1; }
+</style>
+</head>
+<body>
+<h1>QoD Assurance Mock</h1>
+<p>Backend: <code id="base"></code></p>
+
+<div>
+<button onclick="refresh()">Refresh Sessions</button>
+</div>
+
+<div class="row">
+  <div class="col">
+    <h2>Sessions</h2>
+    <ul id="sessions"></ul>
+  </div>
+
+  <div class="col">
+    <h2>Details / Proof</h2>
+    <pre id="details">(click a session)</pre>
+  </div>
+</div>
+
+<script>
+const base = "http://127.0.0.1:8000";
+document.getElementById("base").textContent = base;
+
+async function refresh() {
+  const res = await fetch(`${base}/sessions`);
+  const sessions = await res.json();
+  const ul = document.getElementById("sessions");
+  ul.innerHTML = "";
+
+  for (const s of sessions) {
+    const li = document.createElement("li");
+    li.innerHTML = `<a href="#">${s.session_id}</a> — ${s.qos_profile} — ${s.qos_status}`;
+    li.querySelector("a").onclick = () => showSession(s.session_id);
+    ul.appendChild(li);
+  }
+}
+
+async function showSession(id) {
+  const [sessRes, proofRes] = await Promise.allSettled([
+    fetch(`${base}/sessions/${id}`),
+    fetch(`${base}/proof/${id}`)
+  ]);
+
+  const sess = sessRes.status === "fulfilled"
+    ? await sessRes.value.json()
+    : { error: "no session" };
+
+  let proof = null;
+  if (proofRes.status === "fulfilled" && proofRes.value.ok) {
+    proof = await proofRes.value.json();
+  }
+
+  document.getElementById("details").textContent =
+    JSON.stringify({ session: sess, proof: proof }, null, 2);
+}
+
+refresh();
+</script>
+</body>
+</html>
