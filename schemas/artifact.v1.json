@@ -6,27 +6,25 @@
   "additionalProperties": false,
   "required": ["schema_version", "task", "summary", "outputs"],
   "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "v1"
-    },
-    "task": {
-      "type": "string",
-      "minLength": 1
-    },
-    "summary": {
-      "type": "string",
-      "minLength": 1
-    },
+    "schema_version": { "type": "string", "const": "v1" },
+    "task": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+
     "outputs": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": false,
+      "required": ["proof_record"],
+      "properties": {
+        "proof_record": { "type": "object" }
+      }
     },
+
     "citations": {
       "type": "array",
       "items": { "type": "object" },
       "default": []
     },
+
     "quality": {
       "type": "object",
       "additionalProperties": true
