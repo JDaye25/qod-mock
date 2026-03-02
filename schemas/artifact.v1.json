@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "artifact.v1.json",
+  "title": "Artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task", "summary", "outputs"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "task": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "citations": {
+      "type": "array",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
