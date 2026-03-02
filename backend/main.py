@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dotenv import load_dotenv
 import os
+
 load_dotenv()
 
 import hashlib
@@ -12,6 +13,12 @@ import uuid
 import logging
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Dict, List
+from uuid import UUID
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 # Ensure artifacts directory exists
 Path("artifacts").mkdir(exist_ok=True)
@@ -27,18 +34,13 @@ logging.basicConfig(
 
 log = logging.getLogger("qod")
 log.info("QoD service starting up")
-from typing import Any, Dict, List
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 
 client_id = os.getenv("QOD_CLIENT_ID")
 client_secret = os.getenv("QOD_CLIENT_SECRET")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "qod_mock.sqlite3")
 
-app = FastAPI(title="QoD Assurance Mock (Local)", version="0.1.0") 
+app = FastAPI(title="QoD Assurance Mock (Local)", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,24 +105,53 @@ def _startup() -> None:
 
 
 # ----------------------------
-# Models
+# Models (fail-fast validation)
 # ----------------------------
 class Intent(BaseModel):
-    """A simplified "SLO-like" intent. In real QoD, you would map this to offered QoS profiles."""
-    target_p95_latency_ms: int = Field(..., ge=1, le=5000)
-    target_jitter_ms: int = Field(..., ge=0, le=5000)
-    duration_s: int = Field(..., ge=10, le=24 * 3600)
+    """
+    A simplified "SLO-like" intent. In real QoD, you would map this to offered QoS profiles.
+
+    Fail-fast rules:
+    - text must be present and non-empty (human-friendly)
+    - numeric bounds prevent ridiculous values
+    """
+    model_config = ConfigDict(extra="forbid")  # reject unknown fields fast
+
+    text: str = Field(..., min_length=1, max_length=5000)
+
+    target_p95_latency_ms: int = Field(..., ge=1, le=60_000)
+    target_jitter_ms: int = Field(..., ge=0, le=60_000)
+    duration_s: int = Field(..., ge=1, le=24 * 3600)
+
     flow_label: str = Field("demo-flow", min_length=1, max_length=200)
 
 
 class TelemetrySample(BaseModel):
-    """A minimal telemetry payload from a measurement agent."""
-    session_id: str
-    n: int = Field(..., ge=1, le=100000)
-    p50_ms: float = Field(..., ge=0)
-    p95_ms: float = Field(..., ge=0)
-    jitter_ms: float = Field(..., ge=0)
+    """
+    Minimal telemetry payload from a measurement agent.
+
+    Fail-fast rules:
+    - session_id must be a UUID
+    - p95_ms >= p50_ms
+    - ranges keep garbage out
+    """
+    model_config = ConfigDict(extra="forbid")  # reject unknown fields fast
+
+    session_id: UUID
+
+    n: int = Field(..., ge=1, le=100_000)
+
+    p50_ms: float = Field(..., ge=0, le=60_000)
+    p95_ms: float = Field(..., ge=0, le=60_000)
+    jitter_ms: float = Field(..., ge=0, le=60_000)
+
     notes: str = Field("", max_length=500)
+
+    @model_validator(mode="after")
+    def _sanity(self):
+        if self.p95_ms < self.p50_ms:
+            raise ValueError("Invalid telemetry: p95_ms must be >= p50_ms.")
+        return self
 
 
 # ----------------------------
@@ -215,11 +246,13 @@ def list_sessions() -> List[Dict[str, Any]]:
 
 
 @app.get("/sessions/{session_id}")
-def get_session(session_id: str) -> Dict[str, Any]:
+def get_session(session_id: UUID) -> Dict[str, Any]:
+    sid = str(session_id)
+
     with db() as conn:
         r = conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?",
-            (session_id,),
+            (sid,),
         ).fetchone()
 
     if not r:
@@ -239,11 +272,13 @@ def get_session(session_id: str) -> Dict[str, Any]:
 
 
 @app.delete("/sessions/{session_id}")
-def delete_session(session_id: str) -> Dict[str, str]:
+def delete_session(session_id: UUID) -> Dict[str, str]:
+    sid = str(session_id)
+
     with db() as conn:
-        cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM telemetry WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM proof_ledger WHERE session_id = ?", (session_id,))
+        cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM telemetry WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM proof_ledger WHERE session_id = ?", (sid,))
 
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Unknown session_id")
@@ -253,21 +288,28 @@ def delete_session(session_id: str) -> Dict[str, str]:
 
 @app.post("/telemetry")
 def post_telemetry(sample: TelemetrySample) -> Dict[str, str]:
+    sid = str(sample.session_id)
+
+    # Fail fast: session must exist
     with db() as conn:
         r = conn.execute(
             "SELECT 1 FROM sessions WHERE session_id = ?",
-            (sample.session_id,),
+            (sid,),
         ).fetchone()
 
         if not r:
-            raise HTTPException(status_code=404, detail="Unknown session_id")
+            raise HTTPException(
+                status_code=404,
+                detail="Unknown session_id. Create a session first via POST /intent.",
+            )
 
+        # Store telemetry
         conn.execute(
             """
             INSERT INTO telemetry(session_id, created_at, sample_json)
             VALUES (?, ?, ?)
             """,
-            (sample.session_id, time.time(), sample.model_dump_json()),
+            (sid, time.time(), sample.model_dump_json()),
         )
 
     return {"status": "stored"}
@@ -278,11 +320,13 @@ def sha256_hex(data: bytes) -> str:
 
 
 @app.post("/proof/{session_id}/finalize")
-def finalize_proof(session_id: str) -> Dict[str, Any]:
+def finalize_proof(session_id: UUID) -> Dict[str, Any]:
+    sid = str(session_id)
+
     with db() as conn:
         sess = conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?",
-            (session_id,),
+            (sid,),
         ).fetchone()
 
         if not sess:
@@ -290,7 +334,7 @@ def finalize_proof(session_id: str) -> Dict[str, Any]:
 
         samples = conn.execute(
             "SELECT sample_json FROM telemetry WHERE session_id = ? ORDER BY created_at ASC",
-            (session_id,),
+            (sid,),
         ).fetchall()
 
         prev = conn.execute(
@@ -299,10 +343,19 @@ def finalize_proof(session_id: str) -> Dict[str, Any]:
 
     prev_hash = (prev["this_hash"] if prev else "GENESIS")
 
+    # Fail fast: must have telemetry
     if not samples:
-        raise HTTPException(status_code=400, detail="No telemetry samples found for this session")
+        raise HTTPException(
+            status_code=400,
+            detail="No telemetry samples found for this session. POST /telemetry first.",
+        )
 
     parsed = [json.loads(s["sample_json"]) for s in samples]
+
+    # Extra sanity: avoid mysterious math errors
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Telemetry payloads could not be parsed.")
+
     avg_p50 = sum(p["p50_ms"] for p in parsed) / len(parsed)
     avg_p95 = sum(p["p95_ms"] for p in parsed) / len(parsed)
     avg_jitter = sum(p["jitter_ms"] for p in parsed) / len(parsed)
@@ -312,7 +365,7 @@ def finalize_proof(session_id: str) -> Dict[str, Any]:
     qos_status = simulated_provider_current_status(created_at)
 
     proof = {
-        "session_id": session_id,
+        "session_id": sid,
         "requested": {
             "intent": intent,
             "qos_profile": sess["qos_profile"],
@@ -339,14 +392,15 @@ def finalize_proof(session_id: str) -> Dict[str, Any]:
             INSERT OR REPLACE INTO proof_ledger(session_id, created_at, proof_json, prev_hash, this_hash)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (session_id, time.time(), json.dumps(proof, sort_keys=True), prev_hash, this_hash),
+            (sid, time.time(), json.dumps(proof, sort_keys=True), prev_hash, this_hash),
         )
 
     response = {"prev_hash": prev_hash, "this_hash": this_hash, "proof": proof}
 
+    # Save proof response artifact for audit/debug
     Path("artifacts").mkdir(exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"artifacts/proof_{session_id}_{timestamp}.json"
+    filename = f"artifacts/proof_{sid}_{timestamp}.json"
 
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(response, f, indent=2)
@@ -355,12 +409,15 @@ def finalize_proof(session_id: str) -> Dict[str, Any]:
 
     return response
 
+
 @app.get("/proof/{session_id}")
-def get_proof(session_id: str) -> Dict[str, Any]:
+def get_proof(session_id: UUID) -> Dict[str, Any]:
+    sid = str(session_id)
+
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM proof_ledger WHERE session_id = ?",
-            (session_id,),
+            (sid,),
         ).fetchone()
 
     if not row:
@@ -370,7 +427,7 @@ def get_proof(session_id: str) -> Dict[str, Any]:
         )
 
     return {
-        "session_id": session_id,
+        "session_id": sid,
         "created_at": float(row["created_at"]),
         "prev_hash": row["prev_hash"],
         "this_hash": row["this_hash"],
