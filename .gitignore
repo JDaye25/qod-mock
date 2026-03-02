@@ -1,1 +1,24 @@
+# Virtual environments
+.venv/
 .env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[codz]
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+
+# Local artifacts / logs
+artifacts/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
