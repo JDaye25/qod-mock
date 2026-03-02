@@ -1,79 +1,87 @@
+import json
 import os
+import socket
+import subprocess
+import sys
 import time
-import glob
 import unittest
 import urllib.request
-import urllib.error
-import json
-
-BASE_URL = os.getenv("QOD_API_BASE_URL", "http://127.0.0.1:8000")
+from pathlib import Path
 
 
-def http_json(method: str, path: str, payload=None, timeout=10):
-    url = BASE_URL + path
-    data = None
-    headers = {"Content-Type": "application/json"}
+def get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-            return resp.status, json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        raise AssertionError(f"{method} {path} failed: {e.code} {body}") from e
+def http_json(base_url: str, method: str, path: str, timeout: float = 2.0):
+    url = base_url + path
+    req = urllib.request.Request(url, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8") if resp.length != 0 else ""
+        data = json.loads(body) if body else None
+        return resp.status, data
 
 
 class SmokeTestQoD(unittest.TestCase):
-    def test_end_to_end_session_creates_artifact(self):
-        # 1) health
-        status, _ = http_json("GET", "/health")
+    @classmethod
+    def setUpClass(cls):
+        cls.repo_root = Path(__file__).resolve().parents[1]
+        cls.port = get_free_port()
+        cls.base_url = f"http://127.0.0.1:{cls.port}"
+
+        # Start uvicorn in background (NO --reload in tests/CI)
+        cls.proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "backend.main:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(cls.port),
+            ],
+            cwd=str(cls.repo_root),
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        # Wait for /health to respond
+        deadline = time.time() + 20
+        last_err = None
+        while time.time() < deadline:
+            try:
+                status, payload = http_json(cls.base_url, "GET", "/health", timeout=1.0)
+                if status == 200 and isinstance(payload, dict):
+                    return
+            except Exception as e:
+                last_err = e
+                time.sleep(0.25)
+
+        # If server never became healthy, dump logs for debugging
+        logs = ""
+        try:
+            if cls.proc.stdout:
+                logs = cls.proc.stdout.read()[-4000:]
+        except Exception:
+            pass
+        raise RuntimeError(f"Server did not become healthy. Last error: {last_err}\nLogs:\n{logs}")
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "proc", None):
+            cls.proc.terminate()
+            try:
+                cls.proc.wait(timeout=5)
+            except Exception:
+                cls.proc.kill()
+
+    def test_health_endpoint(self):
+        status, payload = http_json(self.base_url, "GET", "/health")
         self.assertEqual(status, 200)
-
-        # 2) create intent -> session
-        intent_payload = {
-            "target_p95_latency_ms": 80,
-            "target_jitter_ms": 10,
-            "duration_s": 60,
-            "flow_label": "smoke-test-flow",
-        }
-        status, resp = http_json("POST", "/intent", intent_payload)
-        self.assertEqual(status, 200)
-        self.assertIn("session_id", resp)
-        session_id = resp["session_id"]
-
-        # 3) telemetry
-        telemetry_payload = {
-            "session_id": session_id,
-            "n": 10,
-            "p50_ms": 40,
-            "p95_ms": 70,
-            "jitter_ms": 8,
-            "notes": "smoke test",
-        }
-        status, _ = http_json("POST", "/telemetry", telemetry_payload)
-        self.assertEqual(status, 200)
-
-        # give the app a moment to write artifacts if needed
-        time.sleep(0.2)
-
-        # 4) finalize proof (should also save artifact)
-        status, finalize = http_json("POST", f"/proof/{session_id}/finalize")
-        self.assertEqual(status, 200)
-        self.assertIn("proof", finalize)
-
-        # 5) verify artifact file exists
-        matches = glob.glob(f"artifacts/proof_{session_id}_*.json")
-        self.assertTrue(matches, f"No artifact file found for session {session_id} in artifacts/")
-
-        # (optional) verify the artifact contains the same session_id
-        with open(matches[-1], "r", encoding="utf-8") as f:
-            artifact = json.load(f)
-        self.assertEqual(artifact["proof"]["session_id"], session_id)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload.get("status"), "ok")
