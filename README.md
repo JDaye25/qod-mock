@@ -54,6 +54,14 @@ A run is a **PASS** only if all are true:
 
 Otherwise the run is a **FAIL**.
 
+## Artifact Contract (Non-Negotiable)
+
+This service is considered correct only when it produces a schema-valid artifact + proof record after finalization.
+
+### How to run (local)
+```bash
+py -m uvicorn backend.main:app --reload --port 8000
+
 ---
 
 ## Repo Layout (important folders)

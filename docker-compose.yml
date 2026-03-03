@@ -1,6 +1,10 @@
 services:
   qod-api:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_SHA: ${QOD_GIT_SHA:-unknown}
+        IMAGE_TAG: ${QOD_IMAGE_TAG:-local}
     container_name: qod-api
     ports:
       - "8010:8000"

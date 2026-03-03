@@ -11,24 +11,52 @@ import sqlite3
 import time
 import uuid
 import logging
+import platform
+import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, model_validator
+from backend.obs import setup_logging
 
-# Ensure artifacts directory exists
-Path("artifacts").mkdir(exist_ok=True)
+# ----------------------------
+# Artifacts / build identifiers
+# ----------------------------
+# Make artifacts path explicit and mount-friendly:
+# In docker-compose you mount: ./artifacts:/app/artifacts
+# So we default to /app/artifacts when available.
+ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "/app/artifacts"))
+if not ARTIFACTS_DIR.exists():
+    # fallback for non-docker local runs
+    ARTIFACTS_DIR = Path("artifacts")
+
+RUN_SUMMARIES_DIR = ARTIFACTS_DIR / "run_summaries"
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+BUILD_GIT_SHA = os.getenv("GIT_SHA", "unknown")
+BUILD_IMAGE_TAG = os.getenv("IMAGE_TAG", "unknown")
+
+
+def write_run_summary(summary: dict) -> str:
+    RUN_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    sid = summary.get("session_id", "unknown")
+    out = RUN_SUMMARIES_DIR / f"run_{ts}_{sid}.json"
+    out.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    return str(out)
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("artifacts/run.log", encoding="utf-8"),
+        logging.FileHandler(str(ARTIFACTS_DIR / "run.log"), encoding="utf-8"),
     ],
 )
 
@@ -41,6 +69,50 @@ client_secret = os.getenv("QOD_CLIENT_SECRET")
 DB_PATH = os.path.join(os.path.dirname(__file__), "qod_mock.sqlite3")
 
 app = FastAPI(title="QoD Assurance Mock (Local)", version="0.1.0")
+ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "artifacts")).resolve()
+logger = setup_logging(ARTIFACTS_DIR)
+
+@app.middleware("http")
+async def add_request_id_and_log(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    start = time.time()
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        duration_ms = int((time.time() - start) * 1000)
+        logger.exception(
+            "request_failed",
+            extra={
+                "event": "http_request",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": 500,
+                "duration_ms": duration_ms,
+                "error": str(e),
+            },
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal Server Error", "request_id": request_id},
+        )
+
+    duration_ms = int((time.time() - start) * 1000)
+    logger.info(
+        "request",
+        extra={
+            "event": "http_request",
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
+
+    response.headers["x-request-id"] = request_id
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,6 +187,7 @@ class Intent(BaseModel):
     - text must be present and non-empty (human-friendly)
     - numeric bounds prevent ridiculous values
     """
+
     model_config = ConfigDict(extra="forbid")  # reject unknown fields fast
 
     text: str = Field(..., min_length=1, max_length=5000)
@@ -135,6 +208,7 @@ class TelemetrySample(BaseModel):
     - p95_ms >= p50_ms
     - ranges keep garbage out
     """
+
     model_config = ConfigDict(extra="forbid")  # reject unknown fields fast
 
     session_id: UUID
@@ -320,94 +394,158 @@ def sha256_hex(data: bytes) -> str:
 
 
 @app.post("/proof/{session_id}/finalize")
-def finalize_proof(session_id: UUID) -> Dict[str, Any]:
+def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
     sid = str(session_id)
 
-    with db() as conn:
-        sess = conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?",
-            (sid,),
-        ).fetchone()
+    # A simple correlator: use a header if provided, otherwise create one.
+    request_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-correlation-id")
+        or str(uuid.uuid4())
+    )
 
-        if not sess:
-            raise HTTPException(status_code=404, detail="Unknown session_id")
-
-        samples = conn.execute(
-            "SELECT sample_json FROM telemetry WHERE session_id = ? ORDER BY created_at ASC",
-            (sid,),
-        ).fetchall()
-
-        prev = conn.execute(
-            "SELECT this_hash FROM proof_ledger ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-
-    prev_hash = (prev["this_hash"] if prev else "GENESIS")
-
-    # Fail fast: must have telemetry
-    if not samples:
-        raise HTTPException(
-            status_code=400,
-            detail="No telemetry samples found for this session. POST /telemetry first.",
-        )
-
-    parsed = [json.loads(s["sample_json"]) for s in samples]
-
-    # Extra sanity: avoid mysterious math errors
-    if not parsed:
-        raise HTTPException(status_code=400, detail="Telemetry payloads could not be parsed.")
-
-    avg_p50 = sum(p["p50_ms"] for p in parsed) / len(parsed)
-    avg_p95 = sum(p["p95_ms"] for p in parsed) / len(parsed)
-    avg_jitter = sum(p["jitter_ms"] for p in parsed) / len(parsed)
-
-    intent = json.loads(sess["intent_json"])
-    created_at = float(sess["created_at"])
-    qos_status = simulated_provider_current_status(created_at)
-
-    proof = {
+    start_ts = time.time()
+    summary: Dict[str, Any] = {
+        "run_type": "finalize_proof",
+        "request_id": request_id,
         "session_id": sid,
-        "requested": {
-            "intent": intent,
-            "qos_profile": sess["qos_profile"],
+        "build": {
+            "git_sha": BUILD_GIT_SHA,
+            "image_tag": BUILD_IMAGE_TAG,
         },
-        "provider_observed": {
-            "qos_status_at_finalize": qos_status,
-            "provider_note": sess["provider_note"],
+        "timestamps": {
+            "start_utc": datetime.utcnow().isoformat() + "Z",
+            "end_utc": None,
+            "duration_ms": None,
         },
-        "measured_outcomes": {
-            "samples_count": len(parsed),
-            "avg_p50_ms": round(avg_p50, 2),
-            "avg_p95_ms": round(avg_p95, 2),
-            "avg_jitter_ms": round(avg_jitter, 2),
+        "result": {
+            "success": False,
+            "reason": None,
         },
-        "created_at": time.time(),
+        "ids": {
+            "prev_hash": None,
+            "this_hash": None,
+            "proof_artifact_path": None,
+            "run_summary_path": None,
+        },
+        "env": {
+            "hostname": platform.node(),
+        },
     }
 
-    proof_bytes = json.dumps(proof, sort_keys=True).encode("utf-8")
-    this_hash = sha256_hex((prev_hash + "|").encode("utf-8") + proof_bytes)
+    try:
+        with db() as conn:
+            sess = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
 
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO proof_ledger(session_id, created_at, proof_json, prev_hash, this_hash)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (sid, time.time(), json.dumps(proof, sort_keys=True), prev_hash, this_hash),
-        )
+            if not sess:
+                raise HTTPException(status_code=404, detail="Unknown session_id")
 
-    response = {"prev_hash": prev_hash, "this_hash": this_hash, "proof": proof}
+            samples = conn.execute(
+                "SELECT sample_json FROM telemetry WHERE session_id = ? ORDER BY created_at ASC",
+                (sid,),
+            ).fetchall()
 
-    # Save proof response artifact for audit/debug
-    Path("artifacts").mkdir(exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"artifacts/proof_{sid}_{timestamp}.json"
+            prev = conn.execute(
+                "SELECT this_hash FROM proof_ledger ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
 
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(response, f, indent=2)
+        prev_hash = (prev["this_hash"] if prev else "GENESIS")
+        summary["ids"]["prev_hash"] = prev_hash
 
-    log.info("Saved proof artifact to %s", filename)
+        # Fail fast: must have telemetry
+        if not samples:
+            raise HTTPException(
+                status_code=400,
+                detail="No telemetry samples found for this session. POST /telemetry first.",
+            )
 
-    return response
+        parsed = [json.loads(s["sample_json"]) for s in samples]
+
+        # Extra sanity: avoid mysterious math errors
+        if not parsed:
+            raise HTTPException(status_code=400, detail="Telemetry payloads could not be parsed.")
+
+        avg_p50 = sum(p["p50_ms"] for p in parsed) / len(parsed)
+        avg_p95 = sum(p["p95_ms"] for p in parsed) / len(parsed)
+        avg_jitter = sum(p["jitter_ms"] for p in parsed) / len(parsed)
+
+        intent = json.loads(sess["intent_json"])
+        created_at = float(sess["created_at"])
+        qos_status = simulated_provider_current_status(created_at)
+
+        proof = {
+            "session_id": sid,
+            "requested": {
+                "intent": intent,
+                "qos_profile": sess["qos_profile"],
+            },
+            "provider_observed": {
+                "qos_status_at_finalize": qos_status,
+                "provider_note": sess["provider_note"],
+            },
+            "measured_outcomes": {
+                "samples_count": len(parsed),
+                "avg_p50_ms": round(avg_p50, 2),
+                "avg_p95_ms": round(avg_p95, 2),
+                "avg_jitter_ms": round(avg_jitter, 2),
+            },
+            "created_at": time.time(),
+        }
+
+        proof_bytes = json.dumps(proof, sort_keys=True).encode("utf-8")
+        this_hash = sha256_hex((prev_hash + "|").encode("utf-8") + proof_bytes)
+        summary["ids"]["this_hash"] = this_hash
+
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO proof_ledger(session_id, created_at, proof_json, prev_hash, this_hash)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (sid, time.time(), json.dumps(proof, sort_keys=True), prev_hash, this_hash),
+            )
+
+        response = {"prev_hash": prev_hash, "this_hash": this_hash, "proof": proof}
+
+        # Save proof response artifact for audit/debug (to the mounted artifacts dir)
+        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        proof_path = ARTIFACTS_DIR / f"proof_{sid}_{timestamp}.json"
+        proof_path.write_text(json.dumps(response, indent=2), encoding="utf-8")
+
+        summary["ids"]["proof_artifact_path"] = str(proof_path)
+        summary["result"]["success"] = True
+        summary["result"]["reason"] = "ok"
+
+        log.info("Saved proof artifact to %s", proof_path)
+
+        return response
+
+    except HTTPException as e:
+        summary["result"]["success"] = False
+        summary["result"]["reason"] = f"http_{e.status_code}: {e.detail}"
+        raise
+
+    except Exception as e:
+        summary["result"]["success"] = False
+        summary["result"]["reason"] = f"exception: {type(e).__name__}"
+        summary["exception"] = traceback.format_exc()
+        raise
+
+    finally:
+        end_ts = time.time()
+        summary["timestamps"]["end_utc"] = datetime.utcnow().isoformat() + "Z"
+        summary["timestamps"]["duration_ms"] = int((end_ts - start_ts) * 1000)
+
+        try:
+            path = write_run_summary(summary)
+            summary["ids"]["run_summary_path"] = path
+            log.info("Wrote run summary to %s", path)
+        except Exception:
+            log.exception("Failed to write run summary")
 
 
 @app.get("/proof/{session_id}")
