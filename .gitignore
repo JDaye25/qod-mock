@@ -32,3 +32,8 @@ __pycache__/
 secret_test.env
 *.env
 
+
+# never commit secrets
+secret_test.env
+*.env
+
