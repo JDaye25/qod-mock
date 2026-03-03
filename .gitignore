@@ -27,3 +27,8 @@ Thumbs.db
 __pycache__/
 *.pyc
 
+
+# never commit secrets
+secret_test.env
+*.env
+
