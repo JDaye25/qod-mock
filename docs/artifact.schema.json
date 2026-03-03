@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QoD Artifact",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "created_at",
+    "qos_profile",
+    "inputs",
+    "measured",
+    "decision"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "qos_profile": {
+      "type": "string",
+      "enum": [
+        "turbo",
+        "standard",
+        "strict"
+      ]
+    },
+    "inputs": {
+      "type": "object",
+      "required": [
+        "targets",
+        "network"
+      ],
+      "properties": {
+        "targets": {
+          "type": "object",
+          "required": [
+            "max_latency_ms",
+            "min_throughput_mbps",
+            "min_availability_pct"
+          ],
+          "properties": {
+            "max_latency_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5000
+            },
+            "min_throughput_mbps": {
+              "type": "number",
+              "minimum": 0.1,
+              "maximum": 100000
+            },
+            "min_availability_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "additionalProperties": false
+        },
+        "network": {
+          "type": "object",
+          "properties": {
+            "msisdn": {
+              "type": "string"
+            },
+            "ip_address": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "measured": {
+      "type": "object",
+      "required": [
+        "latency_ms",
+        "throughput_mbps",
+        "availability_pct"
+      ],
+      "properties": {
+        "latency_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "throughput_mbps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "availability_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "jitter_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "packet_loss_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "required": [
+        "result",
+        "reasons"
+      ],
+      "properties": {
+        "result": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
