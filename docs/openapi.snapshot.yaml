@@ -1,0 +1,92 @@
+﻿openapi: 3.0.3
+info:
+  title: QoD Artifact API
+  version: "1.0.0"
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: OK
+  /intent:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntentRequest"
+      responses:
+        "200":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntentResponse"
+        "400": { description: Bad Request }
+        "401": { description: Unauthorized }
+  /finalize:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinalizeRequest"
+      responses:
+        "200":
+          description: Finalized artifact produced
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FinalizeResponse"
+        "404": { description: Unknown session_id }
+        "409": { description: Not finalizable }
+        "422": { description: Invariants/thresholds failed }
+components:
+  schemas:
+    IntentRequest:
+      type: object
+      required: [qos_profile, targets, network]
+      properties:
+        qos_profile: { type: string, enum: [turbo, standard, strict] }
+        targets:
+          type: object
+          required: [max_latency_ms, min_throughput_mbps, min_availability_pct]
+          properties:
+            max_latency_ms: { type: integer, minimum: 1, maximum: 5000 }
+            min_throughput_mbps: { type: number, minimum: 0.1, maximum: 100000 }
+            min_availability_pct: { type: number, minimum: 0, maximum: 100 }
+        network:
+          type: object
+          properties:
+            msisdn: { type: string }
+            ip_address: { type: string }
+            country: { type: string }
+    IntentResponse:
+      type: object
+      required: [session_id, qos_profile, created_at, status]
+      properties:
+        session_id: { type: string }
+        qos_profile: { type: string }
+        created_at: { type: string, format: date-time }
+        status: { type: string, enum: [pending] }
+    FinalizeRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id: { type: string }
+    FinalizeResponse:
+      type: object
+      required: [session_id, status, artifact, proof, paths]
+      properties:
+        session_id: { type: string }
+        status: { type: string, enum: [success] }
+        artifact: { type: object }
+        proof: { type: object }
+        paths:
+          type: object
+          required: [artifact_json, proof_json]
+          properties:
+            artifact_json: { type: string }
+            proof_json: { type: string }
