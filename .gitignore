@@ -37,3 +37,7 @@ secret_test.env
 secret_test.env
 *.env
 
+
+# local sqlite db
+backend/qod_mock.sqlite3
+
