@@ -3,7 +3,11 @@ services:
     build: .
     container_name: qod-api
     ports:
-      - "8000:8000"
+      - "8010:8000"
     env_file:
       - .env
+    environment:
+      - QOD_ARTIFACTS_DIR=/app/artifacts
+    volumes:
+      - ./artifacts:/app/artifacts
     restart: unless-stopped
