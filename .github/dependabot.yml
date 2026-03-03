@@ -1,15 +1,11 @@
-﻿version: 2
+version: 2
 updates:
-  # Python dependencies (requirements.txt / pip)
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
 
-  # GitHub Actions (workflow actions versions)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
