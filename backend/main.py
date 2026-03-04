@@ -487,7 +487,10 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
         summary["ids"]["prev_hash"] = prev_hash
 
         if not samples:
-            raise HTTPException(status_code=400, detail="No telemetry samples found for this session. POST /telemetry first.")
+            raise HTTPException(
+                status_code=400,
+                detail="No telemetry samples found for this session. POST /telemetry first.",
+            )
 
         parsed = [json.loads(s["sample_json"]) for s in samples]
         if not parsed:
@@ -660,7 +663,10 @@ def get_proof(session_id: UUID) -> Dict[str, Any]:
         row = conn.execute("SELECT * FROM proof_ledger WHERE session_id = ?", (sid,)).fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="No proof record yet. Call /proof/{id}/finalize first.")
+        raise HTTPException(
+            status_code=404,
+            detail="No proof record yet. Call /proof/{id}/finalize first.",
+        )
 
     return {
         "session_id": sid,

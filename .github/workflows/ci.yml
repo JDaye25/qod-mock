@@ -12,6 +12,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Clean artifacts folder (avoid stale picks)
+        run: |
+          rm -rf artifacts
+          mkdir -p artifacts
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -21,38 +26,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -e .
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
 
       - name: Run tests
         run: |
+          python -m unittest -v tests.test_integration_compose
           python -m unittest discover -s tests -p "test*.py" -v
-
-      - name: Debug latest artifact.json keys (on failure)
-        if: failure()
-        run: |
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          root = Path(".").resolve()
-          artifacts_root = root / "artifacts"
-          candidates = sorted(
-              artifacts_root.glob("*/artifact.json"),
-              key=lambda p: p.stat().st_mtime,
-              reverse=True
-          )
-
-          print("Found artifact.json candidates:", len(candidates))
-          for p in candidates[:5]:
-              print(" -", p.as_posix(), "mtime:", p.stat().st_mtime)
-
-          if candidates:
-              p = candidates[0]
-              data = json.loads(p.read_text(encoding="utf-8-sig"))
-              print("\nLATEST picked:", p.as_posix())
-              print("Top-level keys:", sorted(data.keys()))
-          PY
 
       - name: Upload test artifacts (on failure)
         if: failure()
