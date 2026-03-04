@@ -2,6 +2,7 @@ name: smoke
 
 on:
   push:
+    branches: ["main"]
   pull_request:
 
 jobs:
@@ -13,34 +14,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build and start stack
+      - name: Build + start stack
         run: |
           docker compose up -d --build
 
-      - name: Wait for container to be healthy
+      - name: Wait for /ready on port 8010
+        shell: bash
         run: |
-          set -e
-          for i in $(seq 1 60); do
-            STATUS=$(docker inspect -f '{{.State.Health.Status}}' qod-api 2>/dev/null || echo starting)
-            echo "health=$STATUS"
-            if [ "$STATUS" = "healthy" ]; then
-              echo "Service is healthy"
+          set -euo pipefail
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:8010/ready >/dev/null; then
+              echo "Service is ready"
               exit 0
             fi
             sleep 2
           done
-          echo "Container never became healthy"
+          echo "Ready check failed"
           docker compose logs --no-color
           exit 1
-
-      - name: Debug: docker status
-        run: |
-          docker compose ps
-          docker compose logs --tail 120 --no-color
-
-      - name: Debug: hit /ready on host port 8010
-        run: |
-          curl -v http://127.0.0.1:8010/ready
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,27 +43,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Debug repo and tests
-        run: |
-          pwd
-          ls -la
-          echo "---- tests dir ----"
-          ls -la tests || true
-          echo "---- find test files ----"
-          find . -maxdepth 3 -type f -name "test*.py" -print
-
-      - name: Run tests
+      - name: Run tests (includes smoke + runtime artifact contract)
         env:
           BASE_URL: http://127.0.0.1:8010
         run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
+          python -m unittest discover -s tests -p "test*.py" -v
 
       - name: Logs on failure
         if: failure()
-        run: |
-          docker compose logs --no-color
+        run: docker compose logs --no-color
 
       - name: Tear down
         if: always()
-        run: |
-          docker compose down -v
+        run: docker compose down -v
