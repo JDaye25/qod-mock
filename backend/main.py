@@ -57,13 +57,29 @@ def write_run_summary(summary: dict) -> str:
 # ----------------------------
 # Logging + optional redaction
 # ----------------------------
+# IMPORTANT: logging must never crash app import (CI may not allow writing artifacts/run.log)
+_handlers: List[logging.Handler] = [logging.StreamHandler()]
+
+_log_path = ARTIFACTS_DIR / "run.log"
+try:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write test so we fail here (and fall back) instead of crashing later
+    with open(_log_path, "a", encoding="utf-8"):
+        pass
+
+    _handlers.append(logging.FileHandler(str(_log_path), encoding="utf-8"))
+except Exception as e:
+    # Console-only fallback (still start the server!)
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
+    logging.getLogger("qod").warning(
+        "File logging disabled (cannot write %s): %s", str(_log_path), repr(e)
+    )
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(str(ARTIFACTS_DIR / "run.log"), encoding="utf-8"),
-    ],
+    handlers=_handlers,
 )
 
 log = logging.getLogger("qod")
