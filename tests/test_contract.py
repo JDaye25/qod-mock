@@ -63,19 +63,26 @@ class ContractTests(unittest.TestCase):
         cls.port = get_free_port()
         cls.base_url = f"http://127.0.0.1:{cls.port}"
 
+        logs_dir = cls.repo_root / "artifacts" / "test_logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        cls.log_path = logs_dir / f"uvicorn_contract_{cls.port}.log"
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "backend.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(cls.port),
+        ]
+
+        cls.log_fh = cls.log_path.open("w", encoding="utf-8")
         cls.proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "backend.main:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(cls.port),
-            ],
+            cmd,
             cwd=str(cls.repo_root),
-            stdout=subprocess.PIPE,
+            stdout=cls.log_fh,
             stderr=subprocess.STDOUT,
             text=True,
         )
@@ -91,11 +98,11 @@ class ContractTests(unittest.TestCase):
                 time.sleep(0.25)
 
             logs = ""
-            if cls.proc and cls.proc.stdout:
-                try:
-                    logs = cls.proc.stdout.read()[-6000:]
-                except Exception:
-                    logs = ""
+            try:
+                logs = cls.log_path.read_text(encoding="utf-8")[-6000:]
+            except Exception:
+                logs = ""
+
             raise RuntimeError(f"Server did not become healthy. Last: {last}\nLogs:\n{logs}")
         except Exception:
             cls._kill_proc()
@@ -112,18 +119,17 @@ class ContractTests(unittest.TestCase):
                     cls.proc.kill()
                 except Exception:
                     pass
-            if cls.proc.stdout:
-                try:
-                    cls.proc.stdout.close()
-                except Exception:
-                    pass
+        if getattr(cls, "log_fh", None):
+            try:
+                cls.log_fh.close()
+            except Exception:
+                pass
 
     @classmethod
     def tearDownClass(cls):
         cls._kill_proc()
 
     def test_artifact_contract_file_and_fields(self):
-        # Arrange: make a proof record
         s1, p1 = http_json_with_body(
             self.base_url,
             "POST",
@@ -153,7 +159,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(s4, 200, f"/proof GET: {s4} {proof}")
         self.assertEqual(proof.get("session_id"), session_id)
 
-        # Contract: required filename + required top-level fields + schema validity
+        # Wrapper artifact (must NOT be named artifact.json)
         artifact_obj = {
             "schema_version": "v1",
             "task": "QoD proof finalize (contract test)",
@@ -168,7 +174,7 @@ class ContractTests(unittest.TestCase):
         out_dir = artifacts_dir / str(session_id)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        artifact_json_path = out_dir / "artifact.json"
+        artifact_json_path = out_dir / "artifact_contract_wrapper.json"
         artifact_json_path.write_text(json.dumps(artifact_obj, indent=2), encoding="utf-8")
 
         self.assertTrue(artifact_json_path.exists(), f"Missing {artifact_json_path}")

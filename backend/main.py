@@ -23,66 +23,51 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
-from backend.obs import setup_logging
+from backend.obs import setup_logging, write_run_summary as obs_write_run_summary
 
 
-# ----------------------------
-# Paths / build identifiers
-# ----------------------------
-ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "/app/artifacts"))
-if not ARTIFACTS_DIR.exists():
-    ARTIFACTS_DIR = Path("artifacts")
+# ============================================================
+# Artifacts directory (MUST be writable; tests expect ./artifacts)
+# ============================================================
 
-RUN_SUMMARIES_DIR = ARTIFACTS_DIR / "run_summaries"
-ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+def _pick_writable_artifacts_dir(preferred: Path) -> Path:
+    """
+    Prefer env-configured artifacts dir, but if it's not writable (common in CI or
+    when env points to /app/artifacts on Windows), fall back to ./artifacts.
+    """
+    fallback = Path("artifacts")
 
-BUILD_GIT_SHA = os.getenv("GIT_SHA", "unknown")
-BUILD_IMAGE_TAG = os.getenv("IMAGE_TAG", "unknown")
+    for candidate in (preferred, fallback):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            test_path = candidate / ".write_test"
+            test_path.write_text("ok", encoding="utf-8")
+            test_path.unlink(missing_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+RAW_ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "artifacts"))
+ARTIFACTS_DIR = _pick_writable_artifacts_dir(RAW_ARTIFACTS_DIR).resolve()
+
+BUILD_GIT_SHA = os.getenv("GIT_SHA", os.getenv("QOD_GIT_SHA", "unknown"))
+BUILD_IMAGE_TAG = os.getenv("IMAGE_TAG", os.getenv("QOD_IMAGE_TAG", "unknown"))
 
 
 def utc_now_iso_z() -> str:
-    # Proper UTC ISO string with "Z"
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def write_run_summary(summary: dict) -> str:
-    RUN_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    sid = summary.get("session_id", "unknown")
-    out = RUN_SUMMARIES_DIR / f"run_{ts}_{sid}.json"
-    out.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    return str(out)
-
-
-# ----------------------------
+# ============================================================
 # Logging + optional redaction
-# ----------------------------
-# IMPORTANT: logging must never crash app import (CI may not allow writing artifacts/run.log)
-_handlers: List[logging.Handler] = [logging.StreamHandler()]
+# ============================================================
 
-_log_path = ARTIFACTS_DIR / "run.log"
-try:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Write test so we fail here (and fall back) instead of crashing later
-    with open(_log_path, "a", encoding="utf-8"):
-        pass
-
-    _handlers.append(logging.FileHandler(str(_log_path), encoding="utf-8"))
-except Exception as e:
-    # Console-only fallback (still start the server!)
-    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
-    logging.getLogger("qod").warning(
-        "File logging disabled (cannot write %s): %s", str(_log_path), repr(e)
-    )
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    handlers=_handlers,
-)
-
-log = logging.getLogger("qod")
+logger = setup_logging(ARTIFACTS_DIR)
+log = logger
 log.info("QoD service starting up")
 
 try:
@@ -93,20 +78,21 @@ try:
 except Exception:
     log.info("Log redaction filter not enabled (backend.logging_redact not found)")
 
-client_id = os.getenv("QOD_CLIENT_ID")
-client_secret = os.getenv("QOD_CLIENT_SECRET")
+
+# ============================================================
+# App + DB config
+# ============================================================
 
 DB_PATH = os.getenv("QOD_DB_PATH") or os.path.join(os.path.dirname(__file__), "qod_mock.sqlite3")
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="QoD Assurance Mock (Local)", version="0.1.0")
 
-ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", str(ARTIFACTS_DIR))).resolve()
-logger = setup_logging(ARTIFACTS_DIR)
 
-# ----------------------------
+# ============================================================
 # Request size limit middleware (optional)
-# ----------------------------
+# ============================================================
+
 try:
     from backend.middleware.limits import MaxBodySizeMiddleware  # type: ignore
 
@@ -117,12 +103,13 @@ except Exception:
     log.info("Max body size middleware not enabled (backend.middleware.limits not found)")
 
 
-# ----------------------------
+# ============================================================
 # Request ID + structured request logging
-# ----------------------------
+# ============================================================
+
 @app.middleware("http")
 async def add_request_id_and_log(request: Request, call_next):
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request_id = request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or str(uuid.uuid4())
     start = time.time()
 
     try:
@@ -158,14 +145,14 @@ async def add_request_id_and_log(request: Request, call_next):
             "duration_ms": duration_ms,
         },
     )
-
     response.headers["x-request-id"] = request_id
     return response
 
 
-# ----------------------------
+# ============================================================
 # CORS
-# ----------------------------
+# ============================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -175,9 +162,10 @@ app.add_middleware(
 )
 
 
-# ----------------------------
+# ============================================================
 # DB helpers
-# ----------------------------
+# ============================================================
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -226,14 +214,14 @@ def _startup() -> None:
     init_db()
 
 
-# ----------------------------
+# ============================================================
 # Readiness checks
-# ----------------------------
+# ============================================================
+
 def _sqlite_ready() -> Optional[str]:
     try:
         with db() as conn:
             conn.execute("SELECT 1").fetchone()
-
             needed = {"sessions", "telemetry", "proof_ledger"}
             rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
             have = {r["name"] for r in rows}
@@ -263,14 +251,20 @@ def ready(response: Response) -> Dict[str, Any]:
 
     if problems:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "not-ready", "check": "readiness", "elapsed_ms": elapsed_ms, "problems": problems}
+        return {
+            "status": "not-ready",
+            "check": "readiness",
+            "elapsed_ms": elapsed_ms,
+            "problems": problems,
+        }
 
     return {"status": "ok", "check": "readiness", "elapsed_ms": elapsed_ms}
 
 
-# ----------------------------
+# ============================================================
 # Models
-# ----------------------------
+# ============================================================
+
 class Intent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -298,9 +292,10 @@ class TelemetrySample(BaseModel):
         return self
 
 
-# ----------------------------
+# ============================================================
 # Provider simulation
-# ----------------------------
+# ============================================================
+
 def choose_qos_profile(intent: Intent) -> str:
     if intent.target_p95_latency_ms <= 50:
         return "QOS_LOW_LATENCY"
@@ -335,9 +330,29 @@ def simulated_provider_current_status(created_at: float) -> str:
     return "AVAILABLE" if age >= 2.0 else "REQUESTED"
 
 
-# ----------------------------
+# ============================================================
+# Hashing helpers (fixed)
+# ============================================================
+
+def canonical_json_bytes(obj: Any) -> bytes:
+    """
+    Deterministic JSON encoding so hashes are stable across platforms/formatting.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_json(obj: Any) -> str:
+    return sha256_hex(canonical_json_bytes(obj))
+
+
+# ============================================================
 # API endpoints
-# ----------------------------
+# ============================================================
+
 @app.post("/intent")
 def create_intent_and_session(intent: Intent) -> Dict[str, Any]:
     qos_profile = choose_qos_profile(intent)
@@ -451,12 +466,18 @@ def post_telemetry(sample: TelemetrySample) -> Dict[str, str]:
     return {"status": "stored"}
 
 
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 @app.post("/proof/{session_id}/finalize")
 def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
+    """
+    Finalize a session:
+    - reads telemetry
+    - writes proof ledger (prev_hash/this_hash)
+    - writes:
+        artifacts/proof_<sid>_<ts>.json  (debug proof)
+        artifacts/<sid>/artifact.json   (RUNTIME CONTRACT artifact)
+        artifacts/<sid>/artifact_v1.json (WRAPPER artifact; NOT artifact.json)
+        artifacts/run_summaries/run_<ts>_<sid>.json
+    """
     sid = str(session_id)
 
     request_id = (
@@ -520,6 +541,52 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
         created_at = float(sess["created_at"])
         qos_status = simulated_provider_current_status(created_at)
 
+        # ------------------------------------------------------------
+        # Build runtime artifact first, hash it, then commit that hash in proof
+        # ------------------------------------------------------------
+        session_dir = ARTIFACTS_DIR / sid
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        max_latency_ms = int(min(max(1, int(intent.get("target_p95_latency_ms", 100))), 5000))
+        min_throughput_mbps = 0.1
+        min_availability_pct = 0.0
+
+        reasons: List[str] = []
+        passed = True
+
+        if avg_p95 <= max_latency_ms:
+            reasons.append(f"latency {round(avg_p95, 2)}ms <= target max_latency_ms {max_latency_ms}ms")
+        else:
+            passed = False
+            reasons.append(f"latency {round(avg_p95, 2)}ms > target max_latency_ms {max_latency_ms}ms")
+
+        reasons.append(f"jitter observed {round(avg_jitter, 2)}ms (informational)")
+
+        runtime_artifact = {
+            "schema_version": "v1",
+            "session_id": sid,
+            "created_at": utc_now_iso_z(),
+            "qos_profile": map_qos_to_schema_enum(str(sess["qos_profile"])),
+            "inputs": {
+                "targets": {
+                    "max_latency_ms": max_latency_ms,
+                    "min_throughput_mbps": float(min_throughput_mbps),
+                    "min_availability_pct": float(min_availability_pct),
+                },
+                "network": {"msisdn": "", "ip_address": "", "country": ""},
+            },
+            "measured": {
+                "latency_ms": float(round(avg_p95, 2)),
+                "throughput_mbps": 0.0,
+                "availability_pct": 100.0,
+                "jitter_ms": float(round(avg_jitter, 2)),
+                "packet_loss_pct": 0.0,
+            },
+            "decision": {"result": "pass" if passed else "fail", "reasons": reasons},
+        }
+
+        runtime_artifact_sha256 = sha256_json(runtime_artifact)
+
         proof = {
             "session_id": sid,
             "requested": {"intent": intent, "qos_profile": sess["qos_profile"]},
@@ -533,10 +600,14 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
                 "avg_p95_ms": round(avg_p95, 2),
                 "avg_jitter_ms": round(avg_jitter, 2),
             },
+            "artifacts": {
+                "runtime_artifact_sha256": runtime_artifact_sha256,
+                "runtime_artifact_relpath": f"{sid}/artifact.json",
+            },
             "created_at": time.time(),
         }
 
-        proof_bytes = json.dumps(proof, sort_keys=True).encode("utf-8")
+        proof_bytes = canonical_json_bytes(proof)
         this_hash = sha256_hex((prev_hash + "|").encode("utf-8") + proof_bytes)
         summary["ids"]["this_hash"] = this_hash
 
@@ -551,80 +622,19 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
 
         response_obj = {"prev_hash": prev_hash, "this_hash": this_hash, "proof": proof}
 
+        # ---- debug proof file
         ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-        # ---- proof debug file (fine anywhere; not used by schema tests)
         proof_path = ARTIFACTS_DIR / f"proof_{sid}_{timestamp}.json"
         proof_path.write_text(json.dumps(response_obj, indent=2), encoding="utf-8")
         summary["ids"]["proof_artifact_path"] = str(proof_path)
 
-        # ------------------------------------------------------------
-        # RUNTIME CONTRACT ARTIFACT (THIS MUST BE artifacts/<sid>/artifact.json)
-        # matches docs/artifact.schema.json exactly
-        # ------------------------------------------------------------
-        session_dir = ARTIFACTS_DIR / sid
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        # schema requires max_latency_ms 1..5000
-        max_latency_ms = int(min(max(1, int(intent.get("target_p95_latency_ms", 100))), 5000))
-
-        # schema requires min_throughput_mbps >= 0.1
-        min_throughput_mbps = 0.1
-
-        # schema requires min_availability_pct 0..100
-        min_availability_pct = 0.0
-
-        reasons: List[str] = []
-        passed = True
-
-        if avg_p95 <= max_latency_ms:
-            reasons.append(f"latency {round(avg_p95, 2)}ms <= target max_latency_ms {max_latency_ms}ms")
-        else:
-            passed = False
-            reasons.append(f"latency {round(avg_p95, 2)}ms > target max_latency_ms {max_latency_ms}ms")
-
-        # keep at least 1 reason; adding an informational one is fine
-        reasons.append(f"jitter observed {round(avg_jitter, 2)}ms (informational)")
-
-        runtime_artifact = {
-            "schema_version": "v1",
-            "session_id": sid,
-            "created_at": utc_now_iso_z(),
-            "qos_profile": map_qos_to_schema_enum(str(sess["qos_profile"])),
-            "inputs": {
-                "targets": {
-                    "max_latency_ms": max_latency_ms,
-                    "min_throughput_mbps": float(min_throughput_mbps),
-                    "min_availability_pct": float(min_availability_pct),
-                },
-                "network": {
-                    "msisdn": "",
-                    "ip_address": "",
-                    "country": "",
-                },
-            },
-            "measured": {
-                "latency_ms": float(round(avg_p95, 2)),
-                "throughput_mbps": 0.0,
-                "availability_pct": 100.0,
-                "jitter_ms": float(round(avg_jitter, 2)),
-                "packet_loss_pct": 0.0,
-            },
-            "decision": {
-                "result": "pass" if passed else "fail",
-                "reasons": reasons,
-            },
-        }
-
+        # ---- runtime artifact (reserved filename)
         runtime_path = session_dir / "artifact.json"
         runtime_path.write_text(json.dumps(runtime_artifact, indent=2), encoding="utf-8")
         summary["ids"]["runtime_artifact_path"] = str(runtime_path)
 
-        # ------------------------------------------------------------
-        # WRAPPER ARTIFACT (your other format) — NEVER name it artifact.json
-        # so it can't trick the runtime schema test
-        # ------------------------------------------------------------
+        # ---- wrapper artifact (NEVER artifact.json)
         wrapper_artifact = {
             "schema_version": "v1",
             "task": "QoD proof finalize (wrapper)",
@@ -633,7 +643,6 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
             "citations": [],
             "quality": {"has_telemetry": True, "validated_in_test": True},
         }
-
         wrapper_path = session_dir / "artifact_v1.json"
         wrapper_path.write_text(json.dumps(wrapper_artifact, indent=2), encoding="utf-8")
         summary["ids"]["wrapper_artifact_path"] = str(wrapper_path)
@@ -664,8 +673,9 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
         summary["timestamps"]["duration_ms"] = int((end_ts - start_ts) * 1000)
 
         try:
-            path = write_run_summary(summary)
-            summary["ids"]["run_summary_path"] = path
+            # Prefer obs.py writer (it pins location and is already used elsewhere)
+            path = obs_write_run_summary(ARTIFACTS_DIR, summary)
+            summary["ids"]["run_summary_path"] = str(path)
             log.info("Wrote run summary to %s", path)
         except Exception:
             log.exception("Failed to write run summary")
