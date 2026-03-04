@@ -43,11 +43,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run end-to-end smoke test
+      - name: Debug: show repo + tests
+        run: |
+          pwd
+          ls -la
+          echo "---- tests dir ----"
+          ls -la tests || true
+          echo "---- find test files ----"
+          find . -maxdepth 3 -type f -name "test*.py" -print
+
+      - name: Run tests (discovery)
         env:
           BASE_URL: http://127.0.0.1:8010
         run: |
-          python -m unittest discover -s tests -p "test_smoke.py" -v
+          python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Logs on failure
         if: failure()
