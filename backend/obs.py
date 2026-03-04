@@ -39,8 +39,16 @@ class JsonLineFormatter(logging.Formatter):
 
 
 def setup_logging(artifacts_dir: Path) -> logging.Logger:
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    log_file = artifacts_dir / "run.log"
+    """
+    Configure logging for the app. Must NEVER crash if artifacts_dir is not writable
+    (e.g., GitHub Actions runner permissions / container user mismatch).
+
+    Behavior:
+      - Always logs JSON lines to stdout
+      - Attempts to also log to artifacts_dir/run.log
+      - If file logging fails, falls back to stdout-only (and emits a warning)
+    """
+    artifacts_dir = Path(artifacts_dir)
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -50,13 +58,25 @@ def setup_logging(artifacts_dir: Path) -> logging.Logger:
 
     formatter = JsonLineFormatter()
 
+    # Always have stdout logging
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     root.addHandler(sh)
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(formatter)
-    root.addHandler(fh)
+    # Best-effort file logging (never fatal)
+    log_file = artifacts_dir / "run.log"
+    try:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        # write test so we fail here instead of raising inside FileHandler
+        with open(log_file, "a", encoding="utf-8"):
+            pass
+
+        fh = logging.FileHandler(str(log_file), encoding="utf-8")
+        fh.setFormatter(formatter)
+        root.addHandler(fh)
+    except Exception as e:
+        root.warning("File logging disabled (cannot write %s): %r", str(log_file), e)
 
     # Keep uvicorn access logs from making weird double formats
     logging.getLogger("uvicorn.access").handlers.clear()
