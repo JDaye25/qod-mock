@@ -13,7 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build + start stack
+      - name: Build and start stack
         run: |
           docker compose up -d --build
 
@@ -21,7 +21,7 @@ jobs:
         run: |
           set -e
           for i in $(seq 1 60); do
-            STATUS=$(docker inspect -f '{{.State.Health.Status}}' qod-api 2>/dev/null || echo "starting")
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' qod-api 2>/dev/null || echo starting)
             echo "health=$STATUS"
             if [ "$STATUS" = "healthy" ]; then
               echo "Service is healthy"
@@ -43,7 +43,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Debug: show repo + tests
+      - name: Debug repo and tests
         run: |
           pwd
           ls -la
@@ -52,7 +52,7 @@ jobs:
           echo "---- find test files ----"
           find . -maxdepth 3 -type f -name "test*.py" -print
 
-      - name: Run tests (discovery)
+      - name: Run tests
         env:
           BASE_URL: http://127.0.0.1:8010
         run: |
@@ -60,8 +60,10 @@ jobs:
 
       - name: Logs on failure
         if: failure()
-        run: docker compose logs --no-color
+        run: |
+          docker compose logs --no-color
 
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose down -v
