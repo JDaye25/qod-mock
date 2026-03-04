@@ -15,19 +15,19 @@ import platform
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, model_validator
+
 from backend.obs import setup_logging
 
 # ----------------------------
 # Artifacts / build identifiers
 # ----------------------------
-# Make artifacts path explicit and mount-friendly:
 # In docker-compose you mount: ./artifacts:/app/artifacts
 # So we default to /app/artifacts when available.
 ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "/app/artifacts"))
@@ -51,6 +51,9 @@ def write_run_summary(summary: dict) -> str:
     return str(out)
 
 
+# ----------------------------
+# Basic logging + optional redaction hook
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -63,15 +66,44 @@ logging.basicConfig(
 log = logging.getLogger("qod")
 log.info("QoD service starting up")
 
+# If you created backend/logging_redact.py from the earlier steps, this will enable it.
+# If you DIDN'T create it yet, this will simply skip without breaking startup.
+try:
+    from backend.logging_redact import configure_redaction  # type: ignore
+
+    configure_redaction()
+    log.info("Log redaction filter enabled")
+except Exception:
+    log.info("Log redaction filter not enabled (backend.logging_redact not found)")
+
 client_id = os.getenv("QOD_CLIENT_ID")
 client_secret = os.getenv("QOD_CLIENT_SECRET")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "qod_mock.sqlite3")
 
 app = FastAPI(title="QoD Assurance Mock (Local)", version="0.1.0")
-ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "artifacts")).resolve()
+
+# NOTE: Keep ARTIFACTS_DIR consistent
+ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", str(ARTIFACTS_DIR))).resolve()
 logger = setup_logging(ARTIFACTS_DIR)
 
+# ----------------------------
+# Request size limit middleware (optional)
+# ----------------------------
+# If you created backend/middleware/limits.py from the earlier steps,
+# this will enforce MAX_BODY_BYTES. Otherwise it will be skipped.
+try:
+    from backend.middleware.limits import MaxBodySizeMiddleware  # type: ignore
+
+    MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(1_000_000)))  # 1 MB default
+    app.add_middleware(MaxBodySizeMiddleware, max_bytes=MAX_BODY_BYTES)
+    log.info("Max body size middleware enabled: %s bytes", MAX_BODY_BYTES)
+except Exception:
+    log.info("Max body size middleware not enabled (backend.middleware.limits not found)")
+
+# ----------------------------
+# Request ID + structured request logging
+# ----------------------------
 @app.middleware("http")
 async def add_request_id_and_log(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
@@ -114,6 +146,10 @@ async def add_request_id_and_log(request: Request, call_next):
     response.headers["x-request-id"] = request_id
     return response
 
+
+# ----------------------------
+# CORS
+# ----------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -174,6 +210,63 @@ def init_db() -> None:
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+
+
+# ----------------------------
+# Readiness checks
+# ----------------------------
+def _sqlite_ready() -> Optional[str]:
+    """
+    For this repo, your "real dependency" is the SQLite file.
+    Readiness here means: we can connect AND the expected tables exist.
+    """
+    try:
+        with db() as conn:
+            # basic query to ensure DB opens
+            conn.execute("SELECT 1").fetchone()
+
+            # ensure schema exists (tables)
+            needed = {"sessions", "telemetry", "proof_ledger"}
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+            have = {r["name"] for r in rows}
+            missing = sorted(list(needed - have))
+            if missing:
+                return f"DB schema not ready, missing tables: {missing}"
+        return None
+    except Exception as e:
+        return f"SQLite readiness failed: {type(e).__name__}: {e}"
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    # Liveness only: process is alive
+    return {"status": "ok", "check": "liveness"}
+
+
+@app.get("/ready")
+def ready(response: Response) -> Dict[str, Any]:
+    # Readiness: dependencies OK (for now, SQLite + schema)
+    start = time.time()
+    problems: List[str] = []
+
+    db_problem = _sqlite_ready()
+    if db_problem:
+        problems.append(db_problem)
+
+    elapsed_ms = int((time.time() - start) * 1000)
+
+    if problems:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "not-ready",
+            "check": "readiness",
+            "elapsed_ms": elapsed_ms,
+            "problems": problems,
+        }
+
+    return {"status": "ok", "check": "readiness", "elapsed_ms": elapsed_ms}
 
 
 # ----------------------------
@@ -258,11 +351,6 @@ def simulated_provider_current_status(created_at: float) -> str:
 # ----------------------------
 # API endpoints
 # ----------------------------
-@app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
 @app.post("/intent")
 def create_intent_and_session(intent: Intent) -> Dict[str, Any]:
     log.info("POST /intent called")
@@ -508,13 +596,13 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
                 (sid, time.time(), json.dumps(proof, sort_keys=True), prev_hash, this_hash),
             )
 
-        response = {"prev_hash": prev_hash, "this_hash": this_hash, "proof": proof}
+        response_obj = {"prev_hash": prev_hash, "this_hash": this_hash, "proof": proof}
 
         # Save proof response artifact for audit/debug (to the mounted artifacts dir)
         ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         proof_path = ARTIFACTS_DIR / f"proof_{sid}_{timestamp}.json"
-        proof_path.write_text(json.dumps(response, indent=2), encoding="utf-8")
+        proof_path.write_text(json.dumps(response_obj, indent=2), encoding="utf-8")
 
         summary["ids"]["proof_artifact_path"] = str(proof_path)
         summary["result"]["success"] = True
@@ -522,7 +610,7 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
 
         log.info("Saved proof artifact to %s", proof_path)
 
-        return response
+        return response_obj
 
     except HTTPException as e:
         summary["result"]["success"] = False

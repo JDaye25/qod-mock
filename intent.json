@@ -1,0 +1,7 @@
+﻿{
+  "text": "demo",
+  "target_p95_latency_ms": 120,
+  "target_jitter_ms": 10,
+  "duration_s": 60,
+  "flow_label": "demo-flow"
+}

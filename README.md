@@ -102,3 +102,18 @@ Expected result:
 - All tests pass
 - Server starts successfully
 - Artifact is written under ./artifacts/
+
+## API Endpoint Inventory
+
+Any new route must be added to this inventory in the same pull request.
+
+| Method | Path                           | Auth required | Data sensitivity | Purpose                                | Notes                                                          |
+| ------ | ------------------------------ | ------------: | ---------------- | -------------------------------------- | -------------------------------------------------------------- |
+| GET    | `/health`                      |            No | None             | Health check / uptime probe            | Safe to expose publicly                                        |
+| POST   | `/intent`                      |           No* | Low–Medium       | Start a QoD session / request intent   | *If you plan to monetize, this should require an API key later |
+| GET    | `/sessions`                    |           No* | Medium           | List sessions                          | Consider restricting in production                             |
+| GET    | `/sessions/{session_id}`       |           No* | Medium           | Get session details                    | Consider restricting in production                             |
+| DELETE | `/sessions/{session_id}`       |           No* | Medium           | Delete session                         | Should require auth in production                              |
+| POST   | `/telemetry`                   |           No* | Medium           | Client telemetry ingest                | Rate-limit + validate payload size                             |
+| POST   | `/proof/{session_id}/finalize` |           No* | Medium–High      | Generate final proof/artifact          | This is your “money endpoint” — should require auth            |
+| GET    | `/proof/{session_id}`          |           No* | Medium–High      | Retrieve proof/artifact status/details | Should require auth in production                              |

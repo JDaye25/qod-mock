@@ -2,16 +2,33 @@ services:
   qod-api:
     build:
       context: .
-      args:
-        GIT_SHA: ${QOD_GIT_SHA:-unknown}
-        IMAGE_TAG: ${QOD_IMAGE_TAG:-local}
+      dockerfile: Dockerfile
     container_name: qod-api
+
     ports:
       - "8010:8000"
-    env_file:
-      - .env
+
     environment:
-      - QOD_ARTIFACTS_DIR=/app/artifacts
+      QOD_DB_PATH: /app/data/qod_mock.sqlite3
+      QOD_ARTIFACTS_DIR: /app/artifacts
+      MAX_BODY_BYTES: "1000000"
+
     volumes:
       - ./artifacts:/app/artifacts
+      - ./data:/app/data
+
     restart: unless-stopped
+
+    command: >
+      gunicorn backend.main:app
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --workers 2
+      --timeout 30
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; u=urllib.request.urlopen('http://localhost:8000/ready', timeout=2); sys.exit(0 if 200 <= u.status < 300 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s

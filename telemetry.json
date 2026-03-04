@@ -1,0 +1,8 @@
+﻿{
+  "session_id": "d1bf975c-4385-49a2-a273-085b712a08cb",
+  "n": 100,
+  "p50_ms": 40,
+  "p95_ms": 120,
+  "jitter_ms": 8,
+  "notes": "demo sample"
+}
