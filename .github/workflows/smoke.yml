@@ -47,7 +47,7 @@ jobs:
         env:
           BASE_URL: http://127.0.0.1:8010
         run: |
-          python -m unittest -v tests.test_smoke
+          python -m unittest discover -s tests -p "test_smoke.py" -v
 
       - name: Logs on failure
         if: failure()
