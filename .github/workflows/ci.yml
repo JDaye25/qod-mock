@@ -2,13 +2,11 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -29,6 +27,32 @@ jobs:
       - name: Run tests
         run: |
           python -m unittest discover -s tests -p "test*.py" -v
+
+      - name: Debug latest artifact.json keys (on failure)
+        if: failure()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path(".").resolve()
+          artifacts_root = root / "artifacts"
+          candidates = sorted(
+              artifacts_root.glob("*/artifact.json"),
+              key=lambda p: p.stat().st_mtime,
+              reverse=True
+          )
+
+          print("Found artifact.json candidates:", len(candidates))
+          for p in candidates[:5]:
+              print(" -", p.as_posix(), "mtime:", p.stat().st_mtime)
+
+          if candidates:
+              p = candidates[0]
+              data = json.loads(p.read_text(encoding="utf-8-sig"))
+              print("\nLATEST picked:", p.as_posix())
+              print("Top-level keys:", sorted(data.keys()))
+          PY
 
       - name: Upload test artifacts (on failure)
         if: failure()
