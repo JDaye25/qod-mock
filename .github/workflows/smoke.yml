@@ -1,4 +1,4 @@
-﻿name: smoke
+name: smoke
 
 on:
   push:
@@ -17,17 +17,19 @@ jobs:
         run: |
           docker compose up -d --build
 
-      - name: Wait for /ready on port 8010
+      - name: Wait for container to be healthy
         run: |
           set -e
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8010/ready >/dev/null; then
-              echo "Service is ready"
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' qod-api 2>/dev/null || echo "starting")
+            echo "health=$STATUS"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Service is healthy"
               exit 0
             fi
             sleep 2
           done
-          echo "Ready check failed"
+          echo "Container never became healthy"
           docker compose logs --no-color
           exit 1
 
@@ -38,3 +40,4 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+        
