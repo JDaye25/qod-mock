@@ -183,7 +183,7 @@ class SmokeTestQoD(unittest.TestCase):
         self.assertIn("session_id", proof_payload, f"Unexpected proof shape: {proof_payload}")
         self.assertEqual(proof_payload.get("session_id"), session_id)
 
-        # Wrap proof record into v1 artifact contract
+        # Wrap proof record into v1 artifact contract (wrapper artifact)
         artifact_obj = {
             "schema_version": "v1",
             "task": "QoD proof finalize (smoke test)",
@@ -193,17 +193,20 @@ class SmokeTestQoD(unittest.TestCase):
             "quality": {"has_telemetry": True, "validated_in_test": True},
         }
 
-        # Write artifact.json (stable location for CI/debugging)
+        # IMPORTANT:
+        # artifact.json is reserved for the RUNTIME CONTRACT artifact (docs/artifact.schema.json).
+        # This test writes a WRAPPER artifact (schemas/artifact.v1.json), so it must NOT be named artifact.json
+        # to avoid polluting the runtime schema validator test.
         artifacts_dir = self.repo_root / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         out_dir = artifacts_dir / str(session_id)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        artifact_json_path = out_dir / "artifact.json"
+        artifact_json_path = out_dir / "artifact_smoke_wrapper.json"
         artifact_json_path.write_text(json.dumps(artifact_obj, indent=2), encoding="utf-8")
 
-        # 5) Validate schema
+        # 5) Validate wrapper schema
         validate_artifact_json(
             artifact_json_path,
             self.repo_root / "schemas" / "artifact.v1.json",
