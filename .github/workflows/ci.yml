@@ -8,22 +8,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      QOD_ARTIFACTS_DIR: /tmp/qod-artifacts
+      # Make runner tests and docker volume agree on where artifacts live
+      QOD_ARTIFACTS_DIR: artifacts
+
+      # Make sure EVERY step (including failure/debug) has the signing key
+      QOD_SIGNING_KEY: ${{ secrets.QOD_SIGNING_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Start services
-        env:
-          QOD_SIGNING_KEY: ${{ secrets.QOD_SIGNING_KEY }}
-        run: |
-          docker compose up -d --build
-
       - name: Clean artifacts folder (avoid stale picks)
         run: |
           rm -rf artifacts
           mkdir -p artifacts
+
+      - name: Start services
+        run: |
+          docker compose up -d --build
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,8 +40,6 @@ jobs:
           python -m pip install -e .
 
       - name: Run tests
-        env:
-          QOD_SIGNING_KEY: ${{ secrets.QOD_SIGNING_KEY }}
         run: |
           python -m unittest -v tests.test_integration_compose
           python -m unittest discover -s tests -p "test*.py" -v
