@@ -206,6 +206,43 @@ print("Tampered artifact for", sid)
     _docker_exec_python(container, py)
 
 
+def read_artifact_inside_container(container: str, sid: str) -> str:
+    py = f"""
+from pathlib import Path
+sid = {sid!r}
+p = Path("/app/artifacts") / sid / "artifact.json"
+print(p.read_text(encoding="utf-8"))
+"""
+    payload = base64.b64encode(py.encode("utf-8")).decode("ascii")
+    proc = _run([
+        "docker", "exec", container,
+        "python", "-c",
+        "import base64; exec(base64.b64decode('" + payload + "').decode('utf-8'))"
+    ])
+    if proc.returncode != 0:
+        raise AssertionError(
+            "Failed to read artifact inside container:\n"
+            f"  rc: {proc.returncode}\n"
+            f"  stdout:\n{proc.stdout}\n"
+            f"  stderr:\n{proc.stderr}\n"
+        )
+    return proc.stdout
+
+
+def restore_artifact_inside_container(container: str, sid: str, original_text: str) -> None:
+    payload = base64.b64encode(original_text.encode("utf-8")).decode("ascii")
+    py = f"""
+import base64
+from pathlib import Path
+
+sid = {sid!r}
+p = Path("/app/artifacts") / sid / "artifact.json"
+p.write_text(base64.b64decode({payload!r}).decode("utf-8"), encoding="utf-8")
+print("Restored artifact for", sid)
+"""
+    _docker_exec_python(container, py)
+
+
 class TestIntegrityTamper(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -300,23 +337,47 @@ class TestIntegrityTamper(unittest.TestCase):
     def test_runtime_artifact_tamper_runtime_hash_mismatch(self):
         sid = self._create_session_and_finalize()
 
-        # Try host-side tamper first
+        original_text: str | None = None
+        host_path: Path | None = None
+        tampered_in_container = False
+
         try:
-            runtime_path = find_runtime_artifact_path(sid)
-            obj = json.loads(runtime_path.read_text(encoding="utf-8"))
-            obj["tampered"] = True
-            runtime_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+            # Try host-side tamper first
+            try:
+                host_path = find_runtime_artifact_path(sid)
+                original_text = host_path.read_text(encoding="utf-8")
+                obj = json.loads(original_text)
+                obj["tampered"] = True
+                host_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
-        except PermissionError:
-            # CI: artifacts created by container may be root-owned on host
-            self.assertTrue(docker_available(), "Docker not available to run container-side tamper")
-            self.assertTrue(container_exists(self.container), f"Container {self.container} not running")
-            tamper_artifact_inside_container(self.container, sid)
+            except PermissionError:
+                # CI: artifacts created by container may be root-owned on host
+                self.assertTrue(docker_available(), "Docker not available to run container-side tamper")
+                self.assertTrue(container_exists(self.container), f"Container {self.container} not running")
 
-        v = _http_json("GET", f"{self.base}/proof/{sid}/verify")
-        self.assertFalse(v.get("verified"), f"Expected verified False after artifact tamper, got: {v}")
-        self.assertEqual(v.get("runtime_artifact_verified"), False, f"Expected runtime_artifact_verified False, got: {v}")
-        self.assertNotEqual(v.get("reason"), "ok", f"Expected non-ok reason after tamper, got: {v}")
+                original_text = read_artifact_inside_container(self.container, sid)
+                tamper_artifact_inside_container(self.container, sid)
+                tampered_in_container = True
+
+            v = _http_json("GET", f"{self.base}/proof/{sid}/verify")
+            self.assertFalse(v.get("verified"), f"Expected verified False after artifact tamper, got: {v}")
+            self.assertEqual(v.get("runtime_artifact_verified"), False, f"Expected runtime_artifact_verified False, got: {v}")
+            self.assertNotEqual(v.get("reason"), "ok", f"Expected non-ok reason after tamper, got: {v}")
+
+        finally:
+            # Restore original artifact so other tests don't see 'tampered' field
+            if original_text is not None:
+                try:
+                    if tampered_in_container:
+                        restore_artifact_inside_container(self.container, sid, original_text)
+                    else:
+                        # host restore
+                        if host_path is None:
+                            host_path = find_runtime_artifact_path(sid)
+                        host_path.write_text(original_text, encoding="utf-8")
+                except Exception:
+                    # Don't make cleanup failures fail the test; the core assertions already happened.
+                    pass
 
 
 if __name__ == "__main__":

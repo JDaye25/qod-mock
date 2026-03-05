@@ -7,29 +7,17 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      # Make runner tests and docker volume agree on where artifacts live
-      QOD_ARTIFACTS_DIR: artifacts
 
-      # Make sure EVERY step (including failure/debug) has the signing key
-      QOD_SIGNING_KEY: ${{ secrets.QOD_SIGNING_KEY }}
+    env:
+      QOD_ARTIFACTS_DIR: artifacts
+      QOD_ACTIVE_SIGNING_KID: ${{ secrets.QOD_ACTIVE_SIGNING_KID }}
+      QOD_SIGNING_PRIVATE_KEY_B64URL: ${{ secrets.QOD_SIGNING_PRIVATE_KEY_B64URL }}
+      QOD_SIGNING_PUBLIC_KEY_B64URL: ${{ secrets.QOD_SIGNING_PUBLIC_KEY_B64URL }}
+      QOD_PUBLIC_KEYS: ${{ secrets.QOD_PUBLIC_KEYS }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Clean artifacts folder (avoid stale picks)
-        run: |
-          rm -rf artifacts
-          mkdir -p artifacts
-
-      - name: Sanity check signing key present
-        run: |
-          test -n "$QOD_SIGNING_KEY"
-
-      - name: Start services
-        run: |
-          docker compose up -d --build
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,11 +25,107 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          python -m pip install cryptography
           python -m pip install -e .
+
+      - name: Create CI key generator script
+        shell: bash
+        run: |
+          cat > ci_gen_env.py <<'PY'
+          import os
+          import base64
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          def b64u(b: bytes) -> str:
+              return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+          kid = os.getenv("QOD_ACTIVE_SIGNING_KID") or "default"
+          priv_env = os.getenv("QOD_SIGNING_PRIVATE_KEY_B64URL")
+          pub_env = os.getenv("QOD_SIGNING_PUBLIC_KEY_B64URL")
+          pub_keys = os.getenv("QOD_PUBLIC_KEYS") or ""
+
+          if priv_env and pub_env:
+              print("Using Ed25519 keys from GitHub Secrets.")
+              lines = [
+                  ("QOD_ACTIVE_SIGNING_KID", kid),
+                  ("QOD_SIGNING_PRIVATE_KEY_B64URL", priv_env),
+                  ("QOD_SIGNING_PUBLIC_KEY_B64URL", pub_env),
+                  ("QOD_PUBLIC_KEYS", pub_keys),
+              ]
+          else:
+              print("Generating ephemeral CI keys.")
+              priv = Ed25519PrivateKey.generate()
+              pub = priv.public_key()
+
+              # cryptography supports raw methods in newer versions; this is the compatible form:
+              from cryptography.hazmat.primitives import serialization
+
+              priv_raw = priv.private_bytes(
+                  encoding=serialization.Encoding.Raw,
+                  format=serialization.PrivateFormat.Raw,
+                  encryption_algorithm=serialization.NoEncryption(),
+              )
+              pub_raw = pub.public_bytes(
+                  encoding=serialization.Encoding.Raw,
+                  format=serialization.PublicFormat.Raw,
+              )
+
+              lines = [
+                  ("QOD_ACTIVE_SIGNING_KID", "default"),
+                  ("QOD_SIGNING_PRIVATE_KEY_B64URL", b64u(priv_raw)),
+                  ("QOD_SIGNING_PUBLIC_KEY_B64URL", b64u(pub_raw)),
+                  ("QOD_PUBLIC_KEYS", ""),
+              ]
+
+          with open(".env", "w", encoding="ascii") as f:
+              for k, v in lines:
+                  f.write(f"{k}={v}\n")
+          PY
+
+      - name: Generate .env for docker compose
+        run: |
+          python ci_gen_env.py
+
+      - name: Export .env to runner environment (for in-process tests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .env
+
+          # Write all .env entries into GitHub Actions env for subsequent steps
+          while IFS='=' read -r k v; do
+            # skip blank lines / comments
+            [[ -z "${k:-}" ]] && continue
+            [[ "${k:0:1}" == "#" ]] && continue
+            echo "${k}=${v}" >> "$GITHUB_ENV"
+          done < .env
+
+      - name: Ensure artifacts dir is writable
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          chmod -R u+rwX artifacts || true
+
+      - name: Show .env (keys redacted)
+        run: |
+          sed \
+            -e 's/QOD_SIGNING_PRIVATE_KEY_B64URL=.*/QOD_SIGNING_PRIVATE_KEY_B64URL=[redacted]/' \
+            -e 's/QOD_SIGNING_PUBLIC_KEY_B64URL=.*/QOD_SIGNING_PUBLIC_KEY_B64URL=[redacted]/' \
+            .env
+
+      - name: Clean artifacts directory
+        run: |
+          rm -rf artifacts
+          mkdir -p artifacts
+
+      - name: Start services
+        run: |
+          docker compose --env-file .env up -d --build
+          docker compose --env-file .env ps
 
       - name: Run tests
         run: |
@@ -54,7 +138,7 @@ jobs:
           echo "Artifacts directory listing:"
           ls -la artifacts || true
           echo ""
-          echo "Artifacts files (maxdepth 3):"
+          echo "Artifacts files:"
           find artifacts -maxdepth 3 -type f -print || true
 
       - name: Compose logs (on failure)
@@ -63,7 +147,7 @@ jobs:
           docker compose ps
           docker compose logs --no-color --tail=200
 
-      - name: Upload test artifacts (on failure)
+      - name: Upload artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
