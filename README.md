@@ -1,4 +1,4 @@
-# QoD Mock (qod-mock) — v0.2
+# QoD Mock (qod-mock) — v0.3
 
 ## What this project is
 This repo is a small **Quality-on-Demand (QoD) proof service + test harness**. It lets you:
