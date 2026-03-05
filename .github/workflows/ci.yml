@@ -23,6 +23,10 @@ jobs:
           rm -rf artifacts
           mkdir -p artifacts
 
+      - name: Sanity check signing key present
+        run: |
+          test -n "$QOD_SIGNING_KEY"
+
       - name: Start services
         run: |
           docker compose up -d --build
@@ -43,6 +47,15 @@ jobs:
         run: |
           python -m unittest -v tests.test_integration_compose
           python -m unittest discover -s tests -p "test*.py" -v
+
+      - name: List artifacts
+        if: always()
+        run: |
+          echo "Artifacts directory listing:"
+          ls -la artifacts || true
+          echo ""
+          echo "Artifacts files (maxdepth 3):"
+          find artifacts -maxdepth 3 -type f -print || true
 
       - name: Compose logs (on failure)
         if: failure()
