@@ -46,344 +46,363 @@ JWKS --> Verifier
 
 --------------------------------------------------
 
-QUICK DEMO (LOCAL)
+# QoD Mock (qod-mock) — v0.4
 
-Start the API
+![CI](https://github.com/JDaye25/qod-mock/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+---
+
+# What this project is
+
+This repository is a **Quality-on-Demand (QoD) proof service + verification harness**.
+
+It simulates a telecom QoD workflow and produces **tamper-evident proof records** that can be verified independently.
+
+The system allows a client to:
+
+1. Request network performance targets
+2. Submit telemetry measurements
+3. Produce a signed proof record
+4. Generate a runtime artifact
+5. Verify the proof using public keys
+
+The design goal is **independent verification**.
+
+Any third party can validate a QoD result using:
+
+• the proof record  
+• the runtime artifact  
+• the public key set (JWKS)
+
+---
+
+# Quick Demo (Local)
+
+Start the API:
+
 
 python -m uvicorn backend.main:app --reload --port 8000
 
 
-Generate a proof end-to-end
-
-PowerShell example:
-
-$intent = @{
-  text="demo"
-  target_p95_latency_ms=100
-  target_jitter_ms=20
-  duration_s=30
-  flow_label="readme-demo"
-} | ConvertTo-Json
-
-$r = Invoke-RestMethod -Method POST http://localhost:8000/intent -ContentType "application/json" -Body $intent
-$sid = $r.session_id
-
-$telemetry = @{
-  session_id = $sid
-  n = 200
-  p50_ms = 40
-  p95_ms = 80
-  jitter_ms = 10
-  notes = "readme demo"
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method POST http://localhost:8000/telemetry -ContentType "application/json" -Body $telemetry
-Invoke-RestMethod -Method POST "http://localhost:8000/proof/$sid/finalize" | Out-Null
-
-Invoke-RestMethod "http://localhost:8000/proof/$sid/verify"
+Example flow:
 
 
-Independent verification
+intent
+↓
+telemetry
+↓
+finalize proof
+↓
+artifact + signature
+↓
+verification
 
-python scripts/verify_proof.py http://localhost:8000 <session_id>
 
+---
 
---------------------------------------------------
+# Architecture
 
-WHAT THIS PROJECT IS
-
-This repository is a QoD proof service plus verification harness.
-
-It allows you to:
-
-• Create a QoD intent describing desired network performance  
-• Submit telemetry measurements  
-• Produce a cryptographically signed proof record  
-• Generate deterministic runtime artifacts  
-• Verify results independently using public keys  
-
-Verification layers include:
-
-• runtime artifact hashing  
-• ledger hash chaining  
-• Ed25519 signatures  
-• public key discovery via JWKS  
-
-The design goal is reproducibility and independent verification.
-
-A clean environment should be able to run the project and produce the same artifact structure and validation results.
-
---------------------------------------------------
-
-ARCHITECTURE (HIGH LEVEL)
 
 Client / Test Harness
-
-POST /intent  
-POST /telemetry  
-POST /proof/{sid}/finalize  
-
-↓
-
+│
+│ POST /intent
+│ POST /telemetry
+│ POST /proof/{sid}/finalize
+▼
 QoD API (FastAPI)
-
-writes:
-
-• SQLite rows (sessions / telemetry / proof_ledger)  
-• runtime artifact JSON  
-• wrapper artifact JSON  
-• proof snapshot JSON  
-
-↓
-
+│
+│ writes
+│
+│ SQLite rows
+│ sessions
+│ telemetry
+│ proof_ledger
+│
+│ JSON artifacts
+│ artifacts/{sid}/artifact.json
+│ artifacts/{sid}/artifact_v1.json
+│ artifacts/proof_{sid}_timestamp.json
+▼
 Artifacts + Ledger
-
-independent verification:
-
-• ledger hash recompute  
-• runtime artifact hash recompute  
-• signature verification  
-• public key discovery via JWKS  
-
-↓
-
+│
+│ verification checks
+│
+│ runtime artifact hash
+│ ledger hash chain
+│ ed25519 signature
+│ JWKS key discovery
+▼
 External Verifier
-
 scripts/verify_proof.py
 
---------------------------------------------------
 
-INPUTS / OUTPUTS / SUCCESS CRITERIA
+---
 
-Purpose
+# API Endpoints
 
-Take a user performance request plus telemetry measurements and produce a deterministic artifact that downstream systems can consume while allowing third parties to verify results without trusting the service.
-
---------------------------------------------------
-
-INPUTS
-
-Accepted input format:
-
-JSON HTTP requests to API endpoints.
-
-Core API flow
-
-1. POST /intent  
-Create a QoD session based on requested targets
-
-2. POST /telemetry  
-Submit performance measurements for that session
-
-3. POST /proof/{session_id}/finalize  
-Generate a signed proof and write artifacts
-
-4. GET /proof/{session_id}  
-Fetch proof record
-
-5. GET /proof/{session_id}/verify  
-Verify hashes, chain integrity, and signatures
-
---------------------------------------------------
-
-OUTPUTS
-
-Artifacts are written to the artifacts/ directory.
-
-Runtime artifact
-
-artifacts/{session_id}/artifact.json
-
-Structured JSON describing measured outcomes and pass/fail decision.
+## Create intent
 
 
-Wrapper artifact
-
-artifacts/{session_id}/artifact_v1.json
-
-Run output wrapper containing proof metadata.
+POST /intent
 
 
-Proof snapshot
+Creates a new QoD session.
 
-artifacts/proof_{session_id}_YYYYMMDD_HHMMSS.json
-
-Contains:
-
-prev_hash  
-this_hash  
-signature  
-kid  
-proof  
+Example response:
 
 
-Run summary
-
-artifacts/run_summaries/run_YYYYMMDD_HHMMSS_{session_id}.json
-
-Contains execution metadata and artifact locations.
-
---------------------------------------------------
-
-TAMPER-EVIDENT PROOF DESIGN
-
-Each proof includes multiple layers of integrity verification.
-
-1. Runtime artifact hash
-
-The proof record stores:
-
-runtime_artifact_sha256
-
-The verifier recomputes the hash of:
-
-artifacts/{sid}/artifact.json
+{
+"session_id": "uuid",
+"qos_profile": "QOS_BALANCED",
+"qos_status": "REQUESTED"
+}
 
 
-2. Ledger hash chain
+---
 
-Each proof entry stores:
-
-prev_hash  
-this_hash  
-
-Hash calculation:
-
-this_hash = sha256(prev_hash + "|" + canonical_json(proof))
-
-This creates a tamper-evident chain of proofs.
+## Submit telemetry
 
 
-3. Ed25519 signature
+POST /telemetry
 
-The service signs this_hash.
 
-Stored fields:
+Stores measurement samples.
 
-signature  
-kid  
+---
 
-The verifier:
+## Finalize proof
 
-1. fetches the public key  
-2. verifies the signature  
-3. confirms integrity  
 
---------------------------------------------------
+POST /proof/{session_id}/finalize
 
-PUBLIC KEY DISCOVERY
 
-External verifiers discover signing keys via JWKS.
+Produces:
 
-Standard JWKS endpoint
+• signed proof record  
+• runtime artifact  
+• ledger entry  
+
+---
+
+## Fetch proof
+
+
+GET /proof/{session_id}
+
+
+Returns the stored proof record.
+
+---
+
+## Verify proof
+
+
+GET /proof/{session_id}/verify
+
+
+Server-side verification that checks:
+
+• runtime artifact hash  
+• ledger hash chain  
+• Ed25519 signature  
+• key lookup
+
+Example response:
+
+
+{
+"verified": true,
+"signature_verified": true,
+"ledger_hash_verified": true,
+"runtime_artifact_verified": true
+}
+
+
+---
+
+# Proof Bundle Endpoint
+
+
+GET /proof/{session_id}/bundle
+
+
+Returns everything needed to independently verify a proof.
+
+
+{
+"ledger": {...},
+"proof": {...},
+"runtime_artifact": {...}
+}
+
+
+This endpoint allows a verifier to validate a proof **without making additional API calls**.
+
+---
+
+# Public Key Discovery
+
+The service exposes verification keys using **JWKS**.
+
 
 GET /.well-known/jwks.json
 
 
-Example
+Example:
 
-curl http://localhost:8000/.well-known/jwks.json
-
-
-Example response
 
 {
-  "keys": [
-    {
-      "kty": "OKP",
-      "crv": "Ed25519",
-      "kid": "default",
-      "alg": "EdDSA",
-      "use": "sig",
-      "x": "PUBLIC_KEY_BASE64URL"
-    }
-  ]
+"keys":[
+{
+"kty":"OKP",
+"crv":"Ed25519",
+"alg":"EdDSA",
+"kid":"default",
+"x":"base64url_public_key"
+}
+]
 }
 
 
-Human-friendly endpoint
+External systems can retrieve the key and verify signatures.
 
-GET /public-keys
+---
 
-Returns a simplified list of verification keys.
+# Tamper-Evident Proof Design
 
---------------------------------------------------
+Each proof includes multiple layers of verification.
 
-API INVENTORY
+### Runtime artifact hash
 
-Maintaining an explicit API inventory helps prevent undocumented endpoints and aligns with OWASP API security guidance.
+The proof stores:
 
-Endpoint — Method — Purpose
 
-/health — GET — Liveness check  
-/ready — GET — Readiness check  
-/intent — POST — Create QoD session  
-/telemetry — POST — Submit telemetry samples  
-/proof/{session_id}/finalize — POST — Generate signed proof  
-/proof/{session_id} — GET — Fetch proof record  
-/proof/{session_id}/bundle — GET — Retrieve proof and runtime artifact  
-/proof/{session_id}/verify — GET — Verify proof integrity  
-/.well-known/jwks.json — GET — Publish public verification keys  
-/public-keys — GET — Human-readable key listing  
+runtime_artifact_sha256
 
---------------------------------------------------
 
-SECURITY PROPERTIES
+The verifier recomputes the hash of:
 
-The system provides:
 
-• tamper-evident artifact storage  
-• cryptographic proof signatures  
-• independent verification capability  
-• deterministic artifact generation  
-• public key discovery via JWKS  
+artifacts/{sid}/artifact.json
 
-These properties make proof records auditable and externally verifiable.
 
---------------------------------------------------
+---
 
-VERIFICATION MODEL
+### Ledger hash chain
 
-A third party can verify proofs without trusting the service.
+Each ledger record includes:
 
-Steps:
 
-1. Fetch proof bundle  
-2. Fetch JWKS public keys  
-3. Verify Ed25519 signature  
-4. Recompute ledger hash  
-5. Recompute runtime artifact hash  
+prev_hash
+this_hash
 
-If all checks pass, the proof is valid.
+this_hash = sha256(prev_hash + "|" + canonical_json(proof))
 
---------------------------------------------------
 
-PROJECT GOALS
+This creates a chain of proofs.
 
-This project demonstrates how to build a verifiable telemetry protocol.
+---
 
-Potential use cases include:
+### Ed25519 signature
 
-• telecom network SLA verification  
-• cloud service performance proofs  
-• infrastructure auditing  
-• reproducible telemetry pipelines  
-• compliance evidence systems  
+The service signs:
 
---------------------------------------------------
 
-VERSION
+this_hash
 
-Current version
+
+Stored fields:
+
+
+signature
+kid
+
+
+Verification uses the JWKS public key.
+
+---
+
+# Output Artifacts
+
+When a proof is finalized the system produces:
+
+
+artifacts/{sid}/artifact.json
+
+
+Runtime contract artifact.
+
+
+artifacts/{sid}/artifact_v1.json
+
+
+Wrapper artifact.
+
+
+artifacts/proof_{sid}_timestamp.json
+
+
+Proof snapshot.
+
+
+artifacts/run_summaries/run_timestamp_sid.json
+
+
+Run summary metadata.
+
+---
+
+# Verification Script
+
+The repository includes a local verification tool.
+
+Run:
+
+
+python scripts/verify_proof.py http://localhost:8000
+ <session_id>
+
+
+Expected output:
+
+
+SIGNATURE VALID
+kid: default
+verification successful
+
+
+---
+
+# Why this exists
+
+Network providers often **claim** performance characteristics but cannot prove them later.
+
+This system demonstrates a way to produce **cryptographically verifiable QoD results** that can be audited independently.
+
+Potential use cases:
+
+• telecom QoS assurance  
+• network SLA verification  
+• third-party performance audits  
+• regulatory compliance records
+
+---
+
+# Version
+
+Current version:
+
 
 v0.4
 
 
-Major additions in v0.4
+Major features:
 
-• Ed25519 proof signatures  
-• JWKS public key discovery  
-• key rotation support  
-• proof verification endpoint  
-• independent verifier script  
-• end-to-end demo flow
+• FastAPI QoD proof service  
+• tamper-evident proof ledger  
+• runtime contract artifact  
+• Ed25519 signatures  
+• JWKS key discovery  
+• proof bundle endpoint
