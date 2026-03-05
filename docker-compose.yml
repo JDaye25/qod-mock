@@ -18,13 +18,16 @@ services:
       QOD_ARTIFACTS_DIR: /app/artifacts
       MAX_BODY_BYTES: "1000000"
 
-      # Ed25519 signing (comes from .env via env_file)
-      QOD_ACTIVE_SIGNING_KID: ${QOD_ACTIVE_SIGNING_KID:-default}
-      QOD_SIGNING_PRIVATE_KEY_B64URL: ${QOD_SIGNING_PRIVATE_KEY_B64URL:-}
-      QOD_SIGNING_PUBLIC_KEY_B64URL: ${QOD_SIGNING_PUBLIC_KEY_B64URL:-}
-
       # Optional rotation list for verification (kid1:<pub_b64url>;kid2:<pub_b64url>)
-      QOD_PUBLIC_KEYS: ${QOD_PUBLIC_KEYS:-}
+      # Prefer sourcing from .env via env_file, so we do NOT override it here.
+      # If you want a default when .env is missing, set it in .env itself.
+      # QOD_PUBLIC_KEYS will still be available from .env.
+      #
+      # NOTE: Intentionally NOT setting:
+      # - QOD_ACTIVE_SIGNING_KID
+      # - QOD_SIGNING_PRIVATE_KEY_B64URL
+      # - QOD_SIGNING_PUBLIC_KEY_B64URL
+      # - QOD_PUBLIC_KEYS
 
     volumes:
       - ./artifacts:/app/artifacts
