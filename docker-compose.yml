@@ -10,12 +10,29 @@ services:
     ports:
       - "8010:8000"
 
+    # Load keys from repo-root .env into the container runtime env
+    env_file:
+      - .env
+
     environment:
       QOD_DB_PATH: /app/data/qod_mock.sqlite3
       QOD_ARTIFACTS_DIR: /app/artifacts
       MAX_BODY_BYTES: "1000000"
-      # Require this env var to be set (local shell, .env, or GitHub Actions env)
-      QOD_SIGNING_KEY: ${QOD_SIGNING_KEY:?QOD_SIGNING_KEY is required}
+
+      # Ed25519 signing (current system)
+      # Expected to come from .env via env_file above:
+      #   QOD_ACTIVE_SIGNING_KID
+      #   QOD_SIGNING_PRIVATE_KEY_B64URL
+      #   QOD_SIGNING_PUBLIC_KEY_B64URL
+      #
+      # We DO NOT default these to empty anymore, so config mistakes fail fast.
+      QOD_ACTIVE_SIGNING_KID: ${QOD_ACTIVE_SIGNING_KID:-default}
+      QOD_SIGNING_PRIVATE_KEY_B64URL: ${QOD_SIGNING_PRIVATE_KEY_B64URL:?QOD_SIGNING_PRIVATE_KEY_B64URL is required (set it in .env or CI env)}
+      QOD_SIGNING_PUBLIC_KEY_B64URL: ${QOD_SIGNING_PUBLIC_KEY_B64URL:-}
+
+      # Optional rotation list for verification (matches backend.main support)
+      # Format: "kid1:<pub_b64url>;kid2:<pub_b64url>"
+      QOD_PUBLIC_KEYS: ${QOD_PUBLIC_KEYS:-}
 
     volumes:
       - ./artifacts:/app/artifacts
