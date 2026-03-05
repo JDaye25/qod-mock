@@ -14,6 +14,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Start services
+        env:
+          QOD_SIGNING_KEY: ${{ secrets.QOD_SIGNING_KEY }}
+        run: |
+          docker compose up -d --build
+
       - name: Clean artifacts folder (avoid stale picks)
         run: |
           rm -rf artifacts
@@ -32,9 +38,17 @@ jobs:
           python -m pip install -e .
 
       - name: Run tests
+        env:
+          QOD_SIGNING_KEY: ${{ secrets.QOD_SIGNING_KEY }}
         run: |
           python -m unittest -v tests.test_integration_compose
           python -m unittest discover -s tests -p "test*.py" -v
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=200
 
       - name: Upload test artifacts (on failure)
         if: failure()
