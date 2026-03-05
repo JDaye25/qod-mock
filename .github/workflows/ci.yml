@@ -31,7 +31,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          # Ensure keygen works even if requirements.txt doesn't include it
           python -m pip install cryptography
           python -m pip install -e .
 
@@ -40,32 +39,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -n "${QOD_SIGNING_PRIVATE_KEY_B64URL:-}" ] && [ -n "${QOD_SIGNING_PUBLIC_KEY_B64URL:-}" ]; then
-            echo "Using Ed25519 keys from GitHub Secrets."
-            {
-              echo "QOD_ACTIVE_SIGNING_KID=${QOD_ACTIVE_SIGNING_KID:-default}"
-              echo "QOD_SIGNING_PRIVATE_KEY_B64URL=${QOD_SIGNING_PRIVATE_KEY_B64URL}"
-              echo "QOD_SIGNING_PUBLIC_KEY_B64URL=${QOD_SIGNING_PUBLIC_KEY_B64URL}"
-              echo "QOD_PUBLIC_KEYS=${QOD_PUBLIC_KEYS:-}"
-            } > .env
-          else
-            echo "No Ed25519 secrets set; generating ephemeral CI keys."
-            python - <<'PY' > .env
-import base64
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          python - <<'PY'
+import os, base64
 
-def b64u(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+def write_env(lines):
+    with open(".env", "w", encoding="ascii") as f:
+        for k, v in lines:
+            f.write(f"{k}={v}\n")
 
-priv = Ed25519PrivateKey.generate()
-pub = priv.public_key()
+kid = (os.getenv("QOD_ACTIVE_SIGNING_KID") or "default").strip() or "default"
+priv_b64u = (os.getenv("QOD_SIGNING_PRIVATE_KEY_B64URL") or "").strip()
+pub_b64u  = (os.getenv("QOD_SIGNING_PUBLIC_KEY_B64URL") or "").strip()
+pub_keys  = (os.getenv("QOD_PUBLIC_KEYS") or "").strip()
 
-print("QOD_ACTIVE_SIGNING_KID=default")
-print("QOD_SIGNING_PRIVATE_KEY_B64URL=" + b64u(priv.private_bytes_raw()))
-print("QOD_SIGNING_PUBLIC_KEY_B64URL=" + b64u(pub.public_bytes_raw()))
-print("QOD_PUBLIC_KEYS=")
+if priv_b64u and pub_b64u:
+    print("Using Ed25519 keys from GitHub Secrets.")
+    write_env([
+        ("QOD_ACTIVE_SIGNING_KID", kid),
+        ("QOD_SIGNING_PRIVATE_KEY_B64URL", priv_b64u),
+        ("QOD_SIGNING_PUBLIC_KEY_B64URL", pub_b64u),
+        ("QOD_PUBLIC_KEYS", pub_keys),
+    ])
+else:
+    print("No Ed25519 secrets set; generating ephemeral CI keys.")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    def b64u(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+
+    write_env([
+        ("QOD_ACTIVE_SIGNING_KID", "default"),
+        ("QOD_SIGNING_PRIVATE_KEY_B64URL", b64u(priv.private_bytes_raw())),
+        ("QOD_SIGNING_PUBLIC_KEY_B64URL", b64u(pub.public_bytes_raw())),
+        ("QOD_PUBLIC_KEYS", ""),
+    ])
 PY
-          fi
 
           echo "Generated .env (keys redacted):"
           sed \
