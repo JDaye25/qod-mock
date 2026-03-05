@@ -9,10 +9,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Make runner tests and docker volume agree on where artifacts live
       QOD_ARTIFACTS_DIR: artifacts
 
-      # If you later add GitHub Secrets for these, CI will use them.
+      # Optional secrets; if missing, CI generates ephemeral keys
       QOD_ACTIVE_SIGNING_KID: ${{ secrets.QOD_ACTIVE_SIGNING_KID }}
       QOD_SIGNING_PRIVATE_KEY_B64URL: ${{ secrets.QOD_SIGNING_PRIVATE_KEY_B64URL }}
       QOD_SIGNING_PUBLIC_KEY_B64URL: ${{ secrets.QOD_SIGNING_PUBLIC_KEY_B64URL }}
@@ -28,96 +27,90 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      # Install dependencies BEFORE generating keys
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install cryptography
+          python -m pip install -e .
+
       - name: Generate .env for docker compose (CI)
         shell: bash
         run: |
           set -euo pipefail
 
-          # If secrets exist, write them. Otherwise generate ephemeral keys.
           if [ -n "${QOD_SIGNING_PRIVATE_KEY_B64URL:-}" ] && [ -n "${QOD_SIGNING_PUBLIC_KEY_B64URL:-}" ]; then
             echo "Using Ed25519 keys from GitHub Secrets."
+
             cat > .env <<EOF
           QOD_ACTIVE_SIGNING_KID=${QOD_ACTIVE_SIGNING_KID:-default}
           QOD_SIGNING_PRIVATE_KEY_B64URL=${QOD_SIGNING_PRIVATE_KEY_B64URL}
           QOD_SIGNING_PUBLIC_KEY_B64URL=${QOD_SIGNING_PUBLIC_KEY_B64URL}
           QOD_PUBLIC_KEYS=${QOD_PUBLIC_KEYS:-}
           EOF
+
           else
             echo "No Ed25519 secrets set; generating ephemeral CI keys."
 
-            # Prefer your repo script if present:
             if [ -f gen_keys.py ]; then
               python gen_keys.py > .env
             else
-              python -m pip install --upgrade pip
-              python -m pip install cryptography
-
               python - <<'PY' > .env
-          import base64
-          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-          def b64u(b: bytes) -> str:
-              return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+def b64u(b):
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
-          priv = Ed25519PrivateKey.generate()
-          pub = priv.public_key()
+priv = Ed25519PrivateKey.generate()
+pub = priv.public_key()
 
-          print("QOD_ACTIVE_SIGNING_KID=default")
-          print("QOD_SIGNING_PRIVATE_KEY_B64URL=" + b64u(priv.private_bytes_raw()))
-          print("QOD_SIGNING_PUBLIC_KEY_B64URL="  + b64u(pub.public_bytes_raw()))
-          print("QOD_PUBLIC_KEYS=")
-          PY
+print("QOD_ACTIVE_SIGNING_KID=default")
+print("QOD_SIGNING_PRIVATE_KEY_B64URL=" + b64u(priv.private_bytes_raw()))
+print("QOD_SIGNING_PUBLIC_KEY_B64URL=" + b64u(pub.public_bytes_raw()))
+print("QOD_PUBLIC_KEYS=")
+PY
             fi
           fi
 
-          echo "Wrote .env:"
-          sed -e 's/QOD_SIGNING_PRIVATE_KEY_B64URL=.*/QOD_SIGNING_PRIVATE_KEY_B64URL=[redacted]/' \
-              -e 's/QOD_SIGNING_PUBLIC_KEY_B64URL=.*/QOD_SIGNING_PUBLIC_KEY_B64URL=[redacted]/' \
-              .env
+          echo "Generated .env (keys redacted):"
+          sed \
+            -e 's/QOD_SIGNING_PRIVATE_KEY_B64URL=.*/QOD_SIGNING_PRIVATE_KEY_B64URL=[redacted]/' \
+            -e 's/QOD_SIGNING_PUBLIC_KEY_B64URL=.*/QOD_SIGNING_PUBLIC_KEY_B64URL=[redacted]/' \
+            .env
 
-      - name: Clean artifacts folder (avoid stale picks)
-        shell: bash
+      - name: Clean artifacts directory
         run: |
           rm -rf artifacts
           mkdir -p artifacts
 
       - name: Start services
-        shell: bash
         run: |
           docker compose up -d --build
           docker compose ps
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install -e .
-
       - name: Run tests
-        shell: bash
         run: |
           python -m unittest -v tests.test_integration_compose
           python -m unittest discover -s tests -p "test*.py" -v
 
       - name: List artifacts
         if: always()
-        shell: bash
         run: |
           echo "Artifacts directory listing:"
           ls -la artifacts || true
           echo ""
-          echo "Artifacts files (maxdepth 3):"
+          echo "Artifacts files:"
           find artifacts -maxdepth 3 -type f -print || true
 
       - name: Compose logs (on failure)
         if: failure()
-        shell: bash
         run: |
           docker compose ps
           docker compose logs --no-color --tail=200
 
-      - name: Upload test artifacts (on failure)
+      - name: Upload artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
