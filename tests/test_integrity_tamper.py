@@ -7,6 +7,7 @@ import unittest
 import urllib.request
 import urllib.error
 import subprocess
+import base64
 from pathlib import Path
 
 
@@ -50,8 +51,12 @@ def _wait_ready(base: str, timeout_s: int = 60) -> None:
     raise AssertionError(f"Service never became ready at {ready_url}. Last seen: {last}")
 
 
-def _run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _run_or_fail(cmd: list[str]) -> None:
+    proc = _run(cmd)
     if proc.returncode != 0:
         raise AssertionError(
             "Command failed:\n"
@@ -63,41 +68,31 @@ def _run(cmd: list[str]) -> None:
 
 
 def _compose_up() -> None:
-    # Use docker compose (v2). Assumes docker is installed on the machine/CI runner.
-    _run(["docker", "compose", "up", "-d", "--build"])
-    # In your compose, published port is 8010.
+    _run_or_fail(["docker", "compose", "up", "-d", "--build"])
     _wait_ready("http://127.0.0.1:8010", timeout_s=60)
 
 
 def _compose_down() -> None:
-    _run(["docker", "compose", "down", "--remove-orphans"])
+    _run_or_fail(["docker", "compose", "down", "--remove-orphans"])
 
 
 def _get_base_url_and_ensure_running() -> tuple[str, bool]:
-    """
-    Returns (base_url, started_compose_bool)
-    started_compose_bool indicates whether THIS test started compose (so we may optionally tear down).
-    """
-    # 1) Explicit override
     if os.getenv("QOD_BASE_URL"):
         base = os.environ["QOD_BASE_URL"].rstrip("/")
         _wait_ready(base, timeout_s=30)
         return base, False
 
-    # 2) Probe common bases
     candidates = ["http://127.0.0.1:8010", "http://127.0.0.1:8000"]
     for base in candidates:
         if _url_ok(f"{base}/health", timeout_s=2) or _url_ok(f"{base}/ready", timeout_s=2):
             _wait_ready(base, timeout_s=30)
             return base, False
 
-    # 3) Not reachable → bring up compose ourselves
     _compose_up()
     return "http://127.0.0.1:8010", True
 
 
 def canonical_bytes(obj) -> bytes:
-    # MUST match server canonical_json_bytes
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -125,9 +120,7 @@ def find_db_path() -> Path:
         if c.exists():
             return c
 
-    raise AssertionError(
-        "Could not locate sqlite DB. Looked in data/qod_mock.sqlite3, backend/qod_mock.sqlite3, ./qod_mock.sqlite3"
-    )
+    raise AssertionError("Could not locate sqlite DB on host.")
 
 
 def find_runtime_artifact_path(session_id: str) -> Path:
@@ -135,25 +128,92 @@ def find_runtime_artifact_path(session_id: str) -> Path:
     p = artifacts_dir / session_id / "artifact.json"
     if p.exists():
         return p
-
-    if artifacts_dir.exists():
-        matches = list(artifacts_dir.rglob("artifact.json"))
-        for m in matches:
-            if session_id in str(m):
-                return m
-
     raise AssertionError(f"Could not locate runtime artifact for session {session_id} under {artifacts_dir}")
+
+
+def docker_available() -> bool:
+    return _run(["docker", "version"]).returncode == 0
+
+
+def container_exists(name: str) -> bool:
+    p = _run(["docker", "ps", "--format", "{{.Names}}"])
+    if p.returncode != 0:
+        return False
+    return name in (p.stdout or "")
+
+
+def _docker_exec_python(container: str, py_source: str) -> None:
+    """
+    Runs Python code inside container safely by base64 encoding to avoid quoting issues.
+    """
+    payload = base64.b64encode(py_source.encode("utf-8")).decode("ascii")
+    cmd = [
+        "docker", "exec", container,
+        "python", "-c",
+        "import base64; exec(base64.b64decode('" + payload + "').decode('utf-8'))"
+    ]
+    _run_or_fail(cmd)
+
+
+def tamper_db_inside_container(container: str, sid: str) -> None:
+    py = f"""
+import sqlite3, json, hashlib
+
+sid = {sid!r}
+db_path = "/app/data/qod_mock.sqlite3"
+
+def canonical_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("SELECT proof_json, prev_hash, this_hash, signature FROM proof_ledger WHERE session_id = ?", (sid,))
+row = cur.fetchone()
+if not row:
+    raise SystemExit("No proof_ledger row found for session_id=" + sid)
+
+proof_json, prev_hash, old_this_hash, old_sig = row
+proof = json.loads(proof_json)
+
+proof.setdefault("provider_observed", {{}})
+proof["provider_observed"]["provider_note"] = "evil-simulated-provider"
+
+msg = (str(prev_hash) + "|").encode("utf-8") + canonical_bytes(proof)
+new_this_hash = hashlib.sha256(msg).hexdigest()
+new_proof_json = json.dumps(proof, sort_keys=True)
+
+cur.execute("UPDATE proof_ledger SET proof_json = ?, this_hash = ? WHERE session_id = ?",
+            (new_proof_json, new_this_hash, sid))
+conn.commit()
+conn.close()
+print("Tampered DB row for", sid)
+"""
+    _docker_exec_python(container, py)
+
+
+def tamper_artifact_inside_container(container: str, sid: str) -> None:
+    py = f"""
+import json
+from pathlib import Path
+
+sid = {sid!r}
+p = Path("/app/artifacts") / sid / "artifact.json"
+obj = json.loads(p.read_text(encoding="utf-8"))
+obj["tampered"] = True
+p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+print("Tampered artifact for", sid)
+"""
+    _docker_exec_python(container, py)
 
 
 class TestIntegrityTamper(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.base, cls._started_compose = _get_base_url_and_ensure_running()
+        cls.container = os.getenv("QOD_CONTAINER_NAME", "qod-api")
 
     @classmethod
     def tearDownClass(cls) -> None:
-        # Optional teardown. Default is to leave services running (faster dev loop).
-        # Set QOD_COMPOSE_DOWN=1 to auto-stop compose after tests.
         if getattr(cls, "_started_compose", False) and os.getenv("QOD_COMPOSE_DOWN", "") == "1":
             _compose_down()
 
@@ -177,7 +237,6 @@ class TestIntegrityTamper(unittest.TestCase):
             "notes": "sample-1",
         }
         _http_json("POST", f"{self.base}/telemetry", telemetry)
-
         _http_json("POST", f"{self.base}/proof/{sid}/finalize", {})
 
         v = _http_json("GET", f"{self.base}/proof/{sid}/verify")
@@ -188,51 +247,71 @@ class TestIntegrityTamper(unittest.TestCase):
     def test_db_tamper_signature_mismatch(self):
         sid = self._create_session_and_finalize()
 
-        db_path = find_db_path()
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        # Try host-side tamper first (works locally when files are writable)
+        try:
+            db_path = find_db_path()
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
 
-        cur.execute(
-            "SELECT proof_json, prev_hash, this_hash, signature FROM proof_ledger WHERE session_id = ?",
-            (sid,),
-        )
-        row = cur.fetchone()
-        self.assertIsNotNone(row, f"No proof_ledger row found for session_id={sid}")
+            cur.execute(
+                "SELECT proof_json, prev_hash, this_hash, signature FROM proof_ledger WHERE session_id = ?",
+                (sid,),
+            )
+            row = cur.fetchone()
+            self.assertIsNotNone(row, f"No proof_ledger row found for session_id={sid}")
 
-        proof = json.loads(row["proof_json"])
-        prev_hash = row["prev_hash"]
-        old_sig = row["signature"]
+            proof = json.loads(row["proof_json"])
+            prev_hash = row["prev_hash"]
+            old_sig = row["signature"]
 
-        proof.setdefault("provider_observed", {})
-        proof["provider_observed"]["provider_note"] = "evil-simulated-provider"
+            proof.setdefault("provider_observed", {})
+            proof["provider_observed"]["provider_note"] = "evil-simulated-provider"
 
-        msg = (str(prev_hash) + "|").encode("utf-8") + canonical_bytes(proof)
-        new_this_hash = sha256_hex(msg)
+            msg = (str(prev_hash) + "|").encode("utf-8") + canonical_bytes(proof)
+            new_this_hash = sha256_hex(msg)
 
-        new_proof_json = json.dumps(proof, sort_keys=True)
-        cur.execute(
-            "UPDATE proof_ledger SET proof_json = ?, this_hash = ? WHERE session_id = ?",
-            (new_proof_json, new_this_hash, sid),
-        )
-        conn.commit()
-        conn.close()
+            new_proof_json = json.dumps(proof, sort_keys=True)
+            cur.execute(
+                "UPDATE proof_ledger SET proof_json = ?, this_hash = ? WHERE session_id = ?",
+                (new_proof_json, new_this_hash, sid),
+            )
+            conn.commit()
+            conn.close()
 
+            self.assertTrue(old_sig, "Expected stored signature to be non-empty")
+
+        except sqlite3.OperationalError as e:
+            # CI: sqlite is often readonly on host because container created it as root.
+            if "readonly" not in str(e).lower():
+                raise
+            # Fall back: tamper inside container
+            self.assertTrue(docker_available(), "Docker not available to run container-side tamper")
+            self.assertTrue(container_exists(self.container), f"Container {self.container} not running")
+            tamper_db_inside_container(self.container, sid)
+
+        # Verify should FAIL with signature mismatch but ledger hash verified True
         v = _http_json("GET", f"{self.base}/proof/{sid}/verify")
         self.assertFalse(v.get("verified"), f"Expected verified False, got: {v}")
         self.assertEqual(v.get("reason"), "signature_mismatch", f"Expected signature_mismatch, got: {v}")
         self.assertEqual(v.get("ledger_hash_verified"), True, f"Expected ledger_hash_verified True, got: {v}")
         self.assertEqual(v.get("signature_verified"), False, f"Expected signature_verified False, got: {v}")
-        self.assertTrue(old_sig, "Expected stored signature to be non-empty")
 
     def test_runtime_artifact_tamper_runtime_hash_mismatch(self):
         sid = self._create_session_and_finalize()
 
-        runtime_path = find_runtime_artifact_path(sid)
+        # Try host-side tamper first
+        try:
+            runtime_path = find_runtime_artifact_path(sid)
+            obj = json.loads(runtime_path.read_text(encoding="utf-8"))
+            obj["tampered"] = True
+            runtime_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
-        obj = json.loads(runtime_path.read_text(encoding="utf-8"))
-        obj["tampered"] = True
-        runtime_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+        except PermissionError:
+            # CI: artifacts created by container may be root-owned on host
+            self.assertTrue(docker_available(), "Docker not available to run container-side tamper")
+            self.assertTrue(container_exists(self.container), f"Container {self.container} not running")
+            tamper_artifact_inside_container(self.container, sid)
 
         v = _http_json("GET", f"{self.base}/proof/{sid}/verify")
         self.assertFalse(v.get("verified"), f"Expected verified False after artifact tamper, got: {v}")
