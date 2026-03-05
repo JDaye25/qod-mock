@@ -10,8 +10,6 @@ jobs:
 
     env:
       QOD_ARTIFACTS_DIR: artifacts
-
-      # Optional secrets; if missing, CI generates ephemeral keys
       QOD_ACTIVE_SIGNING_KID: ${{ secrets.QOD_ACTIVE_SIGNING_KID }}
       QOD_SIGNING_PRIVATE_KEY_B64URL: ${{ secrets.QOD_SIGNING_PRIVATE_KEY_B64URL }}
       QOD_SIGNING_PUBLIC_KEY_B64URL: ${{ secrets.QOD_SIGNING_PUBLIC_KEY_B64URL }}
@@ -34,51 +32,52 @@ jobs:
           python -m pip install cryptography
           python -m pip install -e .
 
-      - name: Generate .env for docker compose (CI)
-        shell: bash
+      - name: Create CI key generator script
         run: |
-          set -euo pipefail
+          cat > ci_gen_env.py <<'PY'
+import os
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-          python - <<'PY'
-import os, base64
+def b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
-def write_env(lines):
-    with open(".env", "w", encoding="ascii") as f:
-        for k, v in lines:
-            f.write(f"{k}={v}\n")
+kid = os.getenv("QOD_ACTIVE_SIGNING_KID") or "default"
+priv_env = os.getenv("QOD_SIGNING_PRIVATE_KEY_B64URL")
+pub_env = os.getenv("QOD_SIGNING_PUBLIC_KEY_B64URL")
+pub_keys = os.getenv("QOD_PUBLIC_KEYS") or ""
 
-kid = (os.getenv("QOD_ACTIVE_SIGNING_KID") or "default").strip() or "default"
-priv_b64u = (os.getenv("QOD_SIGNING_PRIVATE_KEY_B64URL") or "").strip()
-pub_b64u  = (os.getenv("QOD_SIGNING_PUBLIC_KEY_B64URL") or "").strip()
-pub_keys  = (os.getenv("QOD_PUBLIC_KEYS") or "").strip()
-
-if priv_b64u and pub_b64u:
+if priv_env and pub_env:
     print("Using Ed25519 keys from GitHub Secrets.")
-    write_env([
+    lines = [
         ("QOD_ACTIVE_SIGNING_KID", kid),
-        ("QOD_SIGNING_PRIVATE_KEY_B64URL", priv_b64u),
-        ("QOD_SIGNING_PUBLIC_KEY_B64URL", pub_b64u),
+        ("QOD_SIGNING_PRIVATE_KEY_B64URL", priv_env),
+        ("QOD_SIGNING_PUBLIC_KEY_B64URL", pub_env),
         ("QOD_PUBLIC_KEYS", pub_keys),
-    ])
+    ]
 else:
-    print("No Ed25519 secrets set; generating ephemeral CI keys.")
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    def b64u(b: bytes) -> str:
-        return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
-
+    print("Generating ephemeral CI keys.")
     priv = Ed25519PrivateKey.generate()
     pub = priv.public_key()
 
-    write_env([
+    lines = [
         ("QOD_ACTIVE_SIGNING_KID", "default"),
         ("QOD_SIGNING_PRIVATE_KEY_B64URL", b64u(priv.private_bytes_raw())),
         ("QOD_SIGNING_PUBLIC_KEY_B64URL", b64u(pub.public_bytes_raw())),
         ("QOD_PUBLIC_KEYS", ""),
-    ])
+    ]
+
+with open(".env", "w", encoding="ascii") as f:
+    for k, v in lines:
+        f.write(f"{k}={v}\n")
 PY
 
-          echo "Generated .env (keys redacted):"
+      - name: Generate .env for docker compose
+        run: |
+          python ci_gen_env.py
+
+      - name: Show .env (keys redacted)
+        run: |
           sed \
             -e 's/QOD_SIGNING_PRIVATE_KEY_B64URL=.*/QOD_SIGNING_PRIVATE_KEY_B64URL=[redacted]/' \
             -e 's/QOD_SIGNING_PUBLIC_KEY_B64URL=.*/QOD_SIGNING_PUBLIC_KEY_B64URL=[redacted]/' \
