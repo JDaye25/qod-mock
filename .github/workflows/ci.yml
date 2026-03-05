@@ -90,6 +90,26 @@ jobs:
         run: |
           python ci_gen_env.py
 
+      - name: Export .env to runner environment (for in-process tests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .env
+
+          # Write all .env entries into GitHub Actions env for subsequent steps
+          while IFS='=' read -r k v; do
+            # skip blank lines / comments
+            [[ -z "${k:-}" ]] && continue
+            [[ "${k:0:1}" == "#" ]] && continue
+            echo "${k}=${v}" >> "$GITHUB_ENV"
+          done < .env
+
+      - name: Ensure artifacts dir is writable
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          chmod -R u+rwX artifacts || true
+
       - name: Show .env (keys redacted)
         run: |
           sed \
@@ -104,8 +124,8 @@ jobs:
 
       - name: Start services
         run: |
-          docker compose up -d --build
-          docker compose ps
+          docker compose --env-file .env up -d --build
+          docker compose --env-file .env ps
 
       - name: Run tests
         run: |
