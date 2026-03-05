@@ -27,11 +27,11 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      # Install dependencies BEFORE generating keys
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          # Ensure keygen works even if requirements.txt doesn't include it
           python -m pip install cryptography
           python -m pip install -e .
 
@@ -42,25 +42,19 @@ jobs:
 
           if [ -n "${QOD_SIGNING_PRIVATE_KEY_B64URL:-}" ] && [ -n "${QOD_SIGNING_PUBLIC_KEY_B64URL:-}" ]; then
             echo "Using Ed25519 keys from GitHub Secrets."
-
-            cat > .env <<EOF
-          QOD_ACTIVE_SIGNING_KID=${QOD_ACTIVE_SIGNING_KID:-default}
-          QOD_SIGNING_PRIVATE_KEY_B64URL=${QOD_SIGNING_PRIVATE_KEY_B64URL}
-          QOD_SIGNING_PUBLIC_KEY_B64URL=${QOD_SIGNING_PUBLIC_KEY_B64URL}
-          QOD_PUBLIC_KEYS=${QOD_PUBLIC_KEYS:-}
-          EOF
-
+            {
+              echo "QOD_ACTIVE_SIGNING_KID=${QOD_ACTIVE_SIGNING_KID:-default}"
+              echo "QOD_SIGNING_PRIVATE_KEY_B64URL=${QOD_SIGNING_PRIVATE_KEY_B64URL}"
+              echo "QOD_SIGNING_PUBLIC_KEY_B64URL=${QOD_SIGNING_PUBLIC_KEY_B64URL}"
+              echo "QOD_PUBLIC_KEYS=${QOD_PUBLIC_KEYS:-}"
+            } > .env
           else
             echo "No Ed25519 secrets set; generating ephemeral CI keys."
-
-            if [ -f gen_keys.py ]; then
-              python gen_keys.py > .env
-            else
-              python - <<'PY' > .env
+            python - <<'PY' > .env
 import base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-def b64u(b):
+def b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
 priv = Ed25519PrivateKey.generate()
@@ -71,7 +65,6 @@ print("QOD_SIGNING_PRIVATE_KEY_B64URL=" + b64u(priv.private_bytes_raw()))
 print("QOD_SIGNING_PUBLIC_KEY_B64URL=" + b64u(pub.public_bytes_raw()))
 print("QOD_PUBLIC_KEYS=")
 PY
-            fi
           fi
 
           echo "Generated .env (keys redacted):"
