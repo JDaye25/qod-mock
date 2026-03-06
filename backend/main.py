@@ -20,9 +20,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 from backend.obs import setup_logging
@@ -34,7 +35,62 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature
 
-QOD_PUBLIC_KEYS = os.getenv("QOD_PUBLIC_KEYS", "")
+
+# ----------------------------
+# API auth (Bearer token) - STRICT + request-time env read
+# ----------------------------
+_auth_scheme = HTTPBearer(auto_error=False)
+
+
+def require_api_key(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
+) -> str:
+    """
+    Require: Authorization: Bearer <token>
+
+    STRICT behavior:
+      - If QOD_API_TOKEN is set (non-empty):
+          * Missing header -> 401
+          * Wrong scheme  -> 401
+          * Wrong token   -> 401
+          * Correct token -> returns token string
+      - If QOD_API_TOKEN is NOT set:
+          * Fail closed -> 500 (prevents "auth accidentally off" confusion)
+
+    IMPORTANT:
+      - We read QOD_API_TOKEN at request-time (NOT import-time) so it works
+        reliably with uvicorn --reload and Windows reloaders.
+    """
+    expected = (os.getenv("QOD_API_TOKEN") or "").strip()
+
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfigured: QOD_API_TOKEN is not set",
+        )
+
+    if creds is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if (creds.scheme or "").lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization scheme must be Bearer",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if creds.credentials != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return creds.credentials
 
 
 # ----------------------------
@@ -162,9 +218,10 @@ def _parse_signing_keys(env_value: Optional[str] = None) -> Dict[str, str]:
     Accepts:
       - entry separators: ';' or ',' or newlines
       - key/value separators: ':' or '='
+
+    Returns dict[kid] = value (raw string; server will validate as needed)
     """
     if env_value is None:
-        # ✅ what your test uses
         env_value = (
             os.environ.get("QOD_SIGNING_KEYS", "")
             or os.environ.get("QOD_PUBLIC_KEYS", "")
@@ -192,21 +249,8 @@ def _parse_signing_keys(env_value: Optional[str] = None) -> Dict[str, str]:
 
         kid = kid.strip()
         val = val.strip()
-        if kid:
+        if kid and val:
             out[kid] = val
-
-    return out
-
-    parts = [p.strip() for p in spec.split(";") if p.strip()]
-    for p in parts:
-        if ":" not in p:
-            continue
-        kid, val = p.split(":", 1)
-        kid = kid.strip()
-        val = val.strip()
-        if not kid:
-            continue
-        out[kid] = val
 
     return out
 
@@ -351,7 +395,7 @@ app = FastAPI(title="QoD Assurance Mock (Local)", version="0.1.0")
 
 logger = setup_logging(ARTIFACTS_DIR)
 log = logging.getLogger("qod")
-log.info("QoD service starting up")
+log.info("QoD service starting up (file=%s pid=%s)", __file__, os.getpid())
 
 try:
     from backend.logging_redact import configure_redaction  # type: ignore
@@ -360,6 +404,25 @@ try:
     log.info("Log redaction filter enabled")
 except Exception:
     log.info("Log redaction filter not enabled (backend.logging_redact not found)")
+
+
+# ----------------------------
+# Debug endpoints (TEMP, but super useful)
+# ----------------------------
+@app.get("/_debug/env")
+def _debug_env() -> Dict[str, Any]:
+    token = (os.getenv("QOD_API_TOKEN") or "").strip()
+    return {
+        "token_present": bool(token),
+        "token_len": len(token),
+        "pid": os.getpid(),
+        "file": __file__,
+    }
+
+
+@app.get("/_debug/protected", dependencies=[Depends(require_api_key)])
+def _debug_protected() -> Dict[str, Any]:
+    return {"ok": True, "pid": os.getpid(), "file": __file__}
 
 
 # ----------------------------
@@ -532,11 +595,13 @@ def _sqlite_ready() -> Optional[str]:
 
 @app.get("/health")
 def health() -> Dict[str, str]:
+    # Keep liveness public so Docker/GHA health checks don't need auth
     return {"status": "ok", "check": "liveness"}
 
 
 @app.get("/ready")
 def ready(response: Response) -> Dict[str, Any]:
+    # Readiness can also be public; it does not leak secrets
     start = time.time()
     problems: List[str] = []
 
@@ -554,7 +619,7 @@ def ready(response: Response) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Public key endpoints
+# Public key endpoints (public)
 # ----------------------------
 @app.get("/.well-known/jwks.json")
 def jwks() -> Dict[str, Any]:
@@ -644,10 +709,10 @@ def simulated_provider_current_status(created_at: float) -> str:
 
 
 # ----------------------------
-# API endpoints
+# API endpoints (protected)
 # ----------------------------
 @app.post("/intent")
-def create_intent_and_session(intent: Intent) -> Dict[str, Any]:
+def create_intent_and_session(intent: Intent, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     qos_profile = choose_qos_profile(intent)
     provider_resp = simulated_provider_create_session(qos_profile, intent.duration_s)
     created_at = time.time()
@@ -678,7 +743,7 @@ def create_intent_and_session(intent: Intent) -> Dict[str, Any]:
 
 
 @app.post("/telemetry")
-def post_telemetry(sample: TelemetrySample) -> Dict[str, str]:
+def post_telemetry(sample: TelemetrySample, _: str = Depends(require_api_key)) -> Dict[str, str]:
     sid = str(sample.session_id)
 
     with db() as conn:
@@ -701,7 +766,7 @@ def post_telemetry(sample: TelemetrySample) -> Dict[str, str]:
 
 
 @app.post("/proof/{session_id}/finalize")
-def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
+def finalize_proof(session_id: UUID, request: Request, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     sid = str(session_id)
 
     request_id = (
@@ -742,9 +807,7 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
                 (sid,),
             ).fetchall()
 
-            prev = conn.execute(
-                "SELECT this_hash FROM proof_ledger ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
+            prev = conn.execute("SELECT this_hash FROM proof_ledger ORDER BY created_at DESC LIMIT 1").fetchone()
 
         prev_hash = (prev["this_hash"] if prev else "GENESIS")
         summary["ids"]["prev_hash"] = prev_hash
@@ -920,10 +983,10 @@ def finalize_proof(session_id: UUID, request: Request) -> Dict[str, Any]:
 
 
 # ----------------------------
-# ✅ NEW: GET /proof/{session_id}  (fixes your verifier script 404)
+# GET /proof/{session_id}
 # ----------------------------
 @app.get("/proof/{session_id}")
-def get_proof(session_id: UUID) -> Dict[str, Any]:
+def get_proof(session_id: UUID, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     sid = str(session_id)
 
     with db() as conn:
@@ -947,10 +1010,10 @@ def get_proof(session_id: UUID) -> Dict[str, Any]:
 
 
 # ----------------------------
-# ✅ NEW: GET /proof/{session_id}/bundle (nice for external verifiers)
+# GET /proof/{session_id}/bundle  (verifier-friendly single fetch)
 # ----------------------------
 @app.get("/proof/{session_id}/bundle")
-def get_proof_bundle(session_id: UUID) -> Dict[str, Any]:
+def get_proof_bundle(session_id: UUID, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     sid = str(session_id)
 
     with db() as conn:
@@ -985,11 +1048,12 @@ def get_proof_bundle(session_id: UUID) -> Dict[str, Any]:
         "proof": proof,
         "runtime_artifact": runtime_obj,
         "runtime_artifact_relpath": relpath,
+        "jwks_url": "/.well-known/jwks.json",
     }
 
 
 @app.get("/proof/{session_id}/verify")
-def verify_proof(session_id: UUID) -> Dict[str, Any]:
+def verify_proof(session_id: UUID, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     sid = str(session_id)
 
     with db() as conn:

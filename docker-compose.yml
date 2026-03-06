@@ -6,6 +6,7 @@ services:
     container_name: qod-api
 
     ports:
+      - "8000:8000"
       - "8010:8000"
 
     # Load keys from repo-root .env (local dev convenience).

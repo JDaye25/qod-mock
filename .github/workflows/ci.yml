@@ -205,9 +205,11 @@ jobs:
           import subprocess
 
           port = os.getenv("API_HOST_PORT", "8000").strip() or "8000"
-          urls = [
+            urls = [
               f"http://127.0.0.1:{port}/health",
               f"http://localhost:{port}/health",
+              f"http://127.0.0.1:8010/health",
+              f"http://localhost:8010/health",
           ]
           last_error = None
 
