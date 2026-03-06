@@ -360,25 +360,26 @@ jobs:
         env:
           TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
           QOD_API_TOKEN: dev-token-123
-          TAMPER_IN_DOCKER_SERVICE: ${{ env.API_SERVICE }}
         run: |
           set -euo pipefail
+          export TAMPER_IN_DOCKER_SERVICE="${API_SERVICE}"
+          echo "Using docker tamper service: ${TAMPER_IN_DOCKER_SERVICE}"
           python -m pytest test_demo_flow.py -v
 
       - name: Run demo_flow.py good
         shell: bash
-        env:
-          TAMPER_IN_DOCKER_SERVICE: ${{ env.API_SERVICE }}
         run: |
           set -euo pipefail
+          export TAMPER_IN_DOCKER_SERVICE="${API_SERVICE}"
+          echo "Using docker tamper service: ${TAMPER_IN_DOCKER_SERVICE}"
           python demo_flow.py --mode good --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
 
       - name: Run demo_flow.py tamper
         shell: bash
-        env:
-          TAMPER_IN_DOCKER_SERVICE: ${{ env.API_SERVICE }}
         run: |
           set -euo pipefail
+          export TAMPER_IN_DOCKER_SERVICE="${API_SERVICE}"
+          echo "Using docker tamper service: ${TAMPER_IN_DOCKER_SERVICE}"
           python demo_flow.py --mode tamper --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
 
       - name: Show logs on failure
