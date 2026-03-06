@@ -1,10 +1,22 @@
+import os
 import subprocess
 import sys
 
 
+def _base_url() -> str:
+    return os.getenv("TEST_BASE_URL", "http://localhost:8000")
+
+
 def test_good_flow():
     result = subprocess.run(
-        [sys.executable, "demo_flow.py", "--mode", "good"],
+        [
+            sys.executable,
+            "demo_flow.py",
+            "--mode",
+            "good",
+            "--base-url",
+            _base_url(),
+        ],
         capture_output=True,
         text=True,
     )
@@ -18,7 +30,14 @@ def test_good_flow():
 
 def test_tamper_flow():
     result = subprocess.run(
-        [sys.executable, "demo_flow.py", "--mode", "tamper"],
+        [
+            sys.executable,
+            "demo_flow.py",
+            "--mode",
+            "tamper",
+            "--base-url",
+            _base_url(),
+        ],
         capture_output=True,
         text=True,
     )
