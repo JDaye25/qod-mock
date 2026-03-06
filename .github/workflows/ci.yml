@@ -227,21 +227,22 @@ jobs:
           PY
 
       # Legacy tests: auth OFF
-      - name: Run compose integration test (auth disabled)
-        shell: bash
-        env:
-          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
-          QOD_API_TOKEN: ""
-        run: |
-          set -euo pipefail
-          python -m unittest -v tests.test_integration_compose
-
-      - name: Run unittest suite (auth disabled)
+      - name: Run compose integration test (auth enabled)
         shell: bash
         env:
           TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
           QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
-          QOD_API_TOKEN: ""
+          QOD_API_TOKEN: dev-token-123
+        run: |
+          set -euo pipefail
+          python -m unittest -v tests.test_integration_compose
+
+      - name: Run unittest suite (auth enabled)
+        shell: bash
+        env:
+          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_TOKEN: dev-token-123
         run: |
           set -euo pipefail
           python -m unittest discover -s tests -p "test*.py" -v
