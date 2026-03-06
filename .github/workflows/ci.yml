@@ -159,18 +159,55 @@ jobs:
           echo "===== docker compose logs (startup) ====="
           docker compose --env-file .env logs --no-color --tail=200 || true
 
+      - name: Detect published API port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          services="$(docker compose --env-file .env config --services)"
+          echo "Compose services:"
+          echo "$services"
+
+          api_service=""
+          for candidate in api qod-api backend web app; do
+            if echo "$services" | grep -qx "$candidate"; then
+              api_service="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$api_service" ]]; then
+            api_service="$(echo "$services" | head -n 1)"
+          fi
+
+          echo "Selected service: $api_service"
+
+          host_port="$(docker compose --env-file .env port "$api_service" 8000 2>/dev/null | tail -n 1 | sed 's/.*://')"
+
+          if [[ -z "${host_port:-}" ]]; then
+            echo "Could not detect published host port for container port 8000."
+            echo "Falling back to 8000."
+            host_port="8000"
+          fi
+
+          echo "Detected host port: $host_port"
+          echo "API_SERVICE=$api_service" >> "$GITHUB_ENV"
+          echo "API_HOST_PORT=$host_port" >> "$GITHUB_ENV"
+
       - name: Wait for API to be ready
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
+          import os
           import time
           import requests
           import subprocess
 
+          port = os.getenv("API_HOST_PORT", "8000").strip() or "8000"
           urls = [
-              "http://127.0.0.1:8000/health",
-              "http://localhost:8000/health",
+              f"http://127.0.0.1:{port}/health",
+              f"http://localhost:{port}/health",
           ]
           last_error = None
 
@@ -196,17 +233,21 @@ jobs:
               check=False,
           )
 
-          raise SystemExit(f"API did not become ready in time. Last error: {last_error}")
+          raise SystemExit(f"API did not become ready in time on port {port}. Last error: {last_error}")
           PY
 
       - name: Run compose integration test
         shell: bash
+        env:
+          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
         run: |
           set -euo pipefail
           python -m unittest -v tests.test_integration_compose
 
       - name: Run unittest suite
         shell: bash
+        env:
+          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
         run: |
           set -euo pipefail
           python -m unittest discover -s tests -p "test*.py" -v
@@ -216,6 +257,18 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest test_demo_flow.py -v
+
+      - name: Run demo_flow.py good
+        shell: bash
+        run: |
+          set -euo pipefail
+          python demo_flow.py --mode good --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
+
+      - name: Run demo_flow.py tamper
+        shell: bash
+        run: |
+          set -euo pipefail
+          python demo_flow.py --mode tamper --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
 
       - name: List artifacts
         if: always()
