@@ -8,7 +8,217 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  legacy-tests:
+    runs-on: ubuntu-latest
+
+    env:
+      QOD_ARTIFACTS_DIR: artifacts
+      QOD_ACTIVE_SIGNING_KID: ${{ secrets.QOD_ACTIVE_SIGNING_KID }}
+      QOD_SIGNING_PRIVATE_KEY_B64URL: ${{ secrets.QOD_SIGNING_PRIVATE_KEY_B64URL }}
+      QOD_SIGNING_PUBLIC_KEY_B64URL: ${{ secrets.QOD_SIGNING_PUBLIC_KEY_B64URL }}
+      QOD_PUBLIC_KEYS: ${{ secrets.QOD_PUBLIC_KEYS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install cryptography requests pytest
+          python -m pip install -e .
+
+      - name: Create CI env for legacy tests (auth disabled)
+        shell: bash
+        run: |
+          cat > ci_gen_env.py <<'PY'
+          import os
+          import base64
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          from cryptography.hazmat.primitives import serialization
+
+          def b64u(b: bytes) -> str:
+              return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+          kid = (os.getenv("QOD_ACTIVE_SIGNING_KID") or "default").strip() or "default"
+          priv_env = (os.getenv("QOD_SIGNING_PRIVATE_KEY_B64URL") or "").strip()
+          pub_env = (os.getenv("QOD_SIGNING_PUBLIC_KEY_B64URL") or "").strip()
+          pub_keys_env = (os.getenv("QOD_PUBLIC_KEYS") or "").strip()
+
+          if priv_env and pub_env:
+              if not pub_keys_env:
+                  pub_keys_env = f"{kid}:{pub_env}"
+              lines = [
+                  ("QOD_API_TOKEN", ""),
+                  ("QOD_ACTIVE_SIGNING_KID", kid),
+                  ("QOD_SIGNING_PRIVATE_KEY_B64URL", priv_env),
+                  ("QOD_SIGNING_PUBLIC_KEY_B64URL", pub_env),
+                  ("QOD_PUBLIC_KEYS", pub_keys_env),
+                  ("QOD_ARTIFACTS_DIR", "artifacts"),
+              ]
+          else:
+              priv = Ed25519PrivateKey.generate()
+              pub = priv.public_key()
+
+              priv_raw = priv.private_bytes(
+                  encoding=serialization.Encoding.Raw,
+                  format=serialization.PrivateFormat.Raw,
+                  encryption_algorithm=serialization.NoEncryption(),
+              )
+              pub_raw = pub.public_bytes(
+                  encoding=serialization.Encoding.Raw,
+                  format=serialization.PublicFormat.Raw,
+              )
+              pub_b64 = b64u(pub_raw)
+
+              lines = [
+                  ("QOD_API_TOKEN", ""),
+                  ("QOD_ACTIVE_SIGNING_KID", "default"),
+                  ("QOD_SIGNING_PRIVATE_KEY_B64URL", b64u(priv_raw)),
+                  ("QOD_SIGNING_PUBLIC_KEY_B64URL", pub_b64),
+                  ("QOD_PUBLIC_KEYS", f"default:{pub_b64}"),
+                  ("QOD_ARTIFACTS_DIR", "artifacts"),
+              ]
+
+          with open(".env", "w", encoding="utf-8") as f:
+              for k, v in lines:
+                  f.write(f"{k}={v}\n")
+          PY
+          python ci_gen_env.py
+
+      - name: Export .env to runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS='=' read -r k v; do
+            [[ -z "${k:-}" ]] && continue
+            [[ "${k:0:1}" == "#" ]] && continue
+            echo "${k}=${v}" >> "$GITHUB_ENV"
+          done < .env
+
+      - name: Prepare artifacts directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          mkdir -p artifacts
+          chmod -R u+rwX artifacts || true
+
+      - name: Start services
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env up -d --build
+          docker compose --env-file .env ps
+
+      - name: Detect published API port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          services="$(docker compose --env-file .env config --services)"
+          api_service=""
+          for candidate in api qod-api backend web app; do
+            if echo "$services" | grep -qx "$candidate"; then
+              api_service="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$api_service" ]]; then
+            api_service="$(echo "$services" | head -n 1)"
+          fi
+
+          host_port="$(docker compose --env-file .env port "$api_service" 8000 2>/dev/null | tail -n 1 | sed 's/.*://')"
+          if [[ -z "${host_port:-}" ]]; then
+            host_port="8000"
+          fi
+
+          echo "API_SERVICE=$api_service" >> "$GITHUB_ENV"
+          echo "API_HOST_PORT=$host_port" >> "$GITHUB_ENV"
+
+      - name: Wait for API to be ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import time
+          import requests
+          import subprocess
+
+          port = os.getenv("API_HOST_PORT", "8000").strip() or "8000"
+          urls = [
+              f"http://127.0.0.1:{port}/health",
+              f"http://localhost:{port}/health",
+          ]
+          last_error = None
+
+          for i in range(60):
+              for url in urls:
+                  try:
+                      r = requests.get(url, timeout=2)
+                      print(f"Attempt {i+1}: {url} -> {r.status_code}")
+                      if r.status_code == 200:
+                          raise SystemExit(0)
+                  except Exception as e:
+                      last_error = e
+              time.sleep(1)
+
+          subprocess.run(["docker", "compose", "--env-file", ".env", "ps"], check=False)
+          subprocess.run(["docker", "compose", "--env-file", ".env", "logs", "--no-color", "--tail=200"], check=False)
+          raise SystemExit(f"API did not become ready in time on port {port}. Last error: {last_error}")
+          PY
+
+      - name: Run compose integration test
+        shell: bash
+        env:
+          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
+        run: |
+          set -euo pipefail
+          python -m unittest -v tests.test_integration_compose
+
+      - name: Run unittest suite
+        shell: bash
+        env:
+          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -p "test*.py" -v
+
+      - name: Compose logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          docker compose --env-file .env ps || true
+          docker compose --env-file .env logs --no-color --tail=200 || true
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-test-artifacts
+          path: |
+            artifacts/**
+            *.log
+
+      - name: Stop services
+        if: always()
+        shell: bash
+        run: |
+          docker compose --env-file .env down -v || true
+
+  auth-flow-tests:
     runs-on: ubuntu-latest
 
     env:
@@ -38,7 +248,7 @@ jobs:
           python -m pip install cryptography requests pytest
           python -m pip install -e .
 
-      - name: Create CI key/env generator script
+      - name: Create CI env for auth flow tests
         shell: bash
         run: |
           cat > ci_gen_env.py <<'PY'
@@ -58,10 +268,8 @@ jobs:
           pub_keys_env = (os.getenv("QOD_PUBLIC_KEYS") or "").strip()
 
           if priv_env and pub_env:
-              print("Using Ed25519 keys from GitHub Secrets.")
               if not pub_keys_env:
                   pub_keys_env = f"{kid}:{pub_env}"
-
               lines = [
                   ("QOD_API_TOKEN", token),
                   ("QOD_ACTIVE_SIGNING_KID", kid),
@@ -71,7 +279,6 @@ jobs:
                   ("QOD_ARTIFACTS_DIR", "artifacts"),
               ]
           else:
-              print("Generating ephemeral CI keys.")
               priv = Ed25519PrivateKey.generate()
               pub = priv.public_key()
 
@@ -84,7 +291,6 @@ jobs:
                   encoding=serialization.Encoding.Raw,
                   format=serialization.PublicFormat.Raw,
               )
-
               pub_b64 = b64u(pub_raw)
 
               lines = [
@@ -100,13 +306,7 @@ jobs:
               for k, v in lines:
                   f.write(f"{k}={v}\n")
           PY
-
-      - name: Generate .env for docker compose
-        shell: bash
-        run: |
-          set -euo pipefail
           python ci_gen_env.py
-          test -f .env
 
       - name: Export .env to runner environment
         shell: bash
@@ -118,19 +318,13 @@ jobs:
             echo "${k}=${v}" >> "$GITHUB_ENV"
           done < .env
 
-      - name: Ensure artifacts dir is writable
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          chmod -R u+rwX artifacts || true
-
-      - name: Clean artifacts directory
+      - name: Prepare artifacts directory
         shell: bash
         run: |
           set -euo pipefail
           rm -rf artifacts
           mkdir -p artifacts
+          chmod -R u+rwX artifacts || true
 
       - name: Start services
         shell: bash
@@ -139,25 +333,12 @@ jobs:
           docker compose --env-file .env up -d --build
           docker compose --env-file .env ps
 
-      - name: Show compose status right after startup
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "===== docker compose ps ====="
-          docker compose --env-file .env ps || true
-          echo ""
-          echo "===== docker compose logs (startup) ====="
-          docker compose --env-file .env logs --no-color --tail=200 || true
-
       - name: Detect published API port
         shell: bash
         run: |
           set -euo pipefail
 
           services="$(docker compose --env-file .env config --services)"
-          echo "Compose services:"
-          echo "$services"
-
           api_service=""
           for candidate in api qod-api backend web app; do
             if echo "$services" | grep -qx "$candidate"; then
@@ -165,22 +346,15 @@ jobs:
               break
             fi
           done
-
           if [[ -z "$api_service" ]]; then
             api_service="$(echo "$services" | head -n 1)"
           fi
 
-          echo "Selected service: $api_service"
-
           host_port="$(docker compose --env-file .env port "$api_service" 8000 2>/dev/null | tail -n 1 | sed 's/.*://')"
-
           if [[ -z "${host_port:-}" ]]; then
-            echo "Could not detect published host port for container port 8000."
-            echo "Falling back to 8000."
             host_port="8000"
           fi
 
-          echo "Detected host port: $host_port"
           echo "API_SERVICE=$api_service" >> "$GITHUB_ENV"
           echo "API_HOST_PORT=$host_port" >> "$GITHUB_ENV"
 
@@ -207,48 +381,17 @@ jobs:
                       r = requests.get(url, timeout=2)
                       print(f"Attempt {i+1}: {url} -> {r.status_code}")
                       if r.status_code == 200:
-                          print(f"API is up at {url}")
                           raise SystemExit(0)
                   except Exception as e:
-                      print(f"Attempt {i+1}: {url} -> error: {e}")
                       last_error = e
               time.sleep(1)
 
-          print("===== docker compose ps =====")
           subprocess.run(["docker", "compose", "--env-file", ".env", "ps"], check=False)
-
-          print("===== docker compose logs =====")
-          subprocess.run(
-              ["docker", "compose", "--env-file", ".env", "logs", "--no-color", "--tail=200"],
-              check=False,
-          )
-
+          subprocess.run(["docker", "compose", "--env-file", ".env", "logs", "--no-color", "--tail=200"], check=False)
           raise SystemExit(f"API did not become ready in time on port {port}. Last error: {last_error}")
           PY
 
-      # Legacy tests: auth OFF
-      - name: Run compose integration test (auth enabled)
-        shell: bash
-        env:
-          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
-          QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
-          QOD_API_TOKEN: dev-token-123
-        run: |
-          set -euo pipefail
-          python -m unittest -v tests.test_integration_compose
-
-      - name: Run unittest suite (auth enabled)
-        shell: bash
-        env:
-          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
-          QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
-          QOD_API_TOKEN: dev-token-123
-        run: |
-          set -euo pipefail
-          python -m unittest discover -s tests -p "test*.py" -v
-
-      # Auth-specific flow tests: auth ON
-      - name: Run demo flow tests (auth enabled)
+      - name: Run demo flow pytest tests
         shell: bash
         env:
           TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
@@ -257,44 +400,30 @@ jobs:
           set -euo pipefail
           python -m pytest test_demo_flow.py -v
 
-      - name: Run demo_flow.py good (auth enabled)
+      - name: Run demo_flow.py good
         shell: bash
-        env:
-          QOD_API_TOKEN: dev-token-123
         run: |
           set -euo pipefail
           python demo_flow.py --mode good --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
 
-      - name: Run demo_flow.py tamper (auth enabled)
+      - name: Run demo_flow.py tamper
         shell: bash
-        env:
-          QOD_API_TOKEN: dev-token-123
         run: |
           set -euo pipefail
           python demo_flow.py --mode tamper --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
 
-      - name: List artifacts
-        if: always()
-        shell: bash
-        run: |
-          echo "Artifacts directory listing:"
-          ls -la artifacts || true
-          echo ""
-          echo "Artifacts files:"
-          find artifacts -maxdepth 3 -type f -print || true
-
-      - name: Compose logs (on failure)
+      - name: Compose logs on failure
         if: failure()
         shell: bash
         run: |
           docker compose --env-file .env ps || true
           docker compose --env-file .env logs --no-color --tail=200 || true
 
-      - name: Upload artifacts (on failure)
+      - name: Upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-artifacts
+          name: auth-flow-test-artifacts
           path: |
             artifacts/**
             *.log
