@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -149,6 +149,16 @@ jobs:
           docker compose --env-file .env up -d --build
           docker compose --env-file .env ps
 
+      - name: Show compose status right after startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "===== docker compose ps ====="
+          docker compose --env-file .env ps || true
+          echo ""
+          echo "===== docker compose logs (startup) ====="
+          docker compose --env-file .env logs --no-color --tail=200 || true
+
       - name: Wait for API to be ready
         shell: bash
         run: |
@@ -156,6 +166,7 @@ jobs:
           python - <<'PY'
           import time
           import requests
+          import subprocess
 
           urls = [
               "http://127.0.0.1:8000/health",
@@ -163,16 +174,27 @@ jobs:
           ]
           last_error = None
 
-          for _ in range(60):
+          for i in range(60):
               for url in urls:
                   try:
                       r = requests.get(url, timeout=2)
+                      print(f"Attempt {i+1}: {url} -> {r.status_code}")
                       if r.status_code == 200:
                           print(f"API is up at {url}")
                           raise SystemExit(0)
                   except Exception as e:
+                      print(f"Attempt {i+1}: {url} -> error: {e}")
                       last_error = e
               time.sleep(1)
+
+          print("===== docker compose ps =====")
+          subprocess.run(["docker", "compose", "--env-file", ".env", "ps"], check=False)
+
+          print("===== docker compose logs =====")
+          subprocess.run(
+              ["docker", "compose", "--env-file", ".env", "logs", "--no-color", "--tail=200"],
+              check=False,
+          )
 
           raise SystemExit(f"API did not become ready in time. Last error: {last_error}")
           PY
