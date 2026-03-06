@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from typing import Any, Dict
@@ -149,38 +150,42 @@ def _candidate_docker_services() -> list[str]:
 
 def _try_docker_tamper(tamper_script: str, session_id: str) -> subprocess.CompletedProcess[str] | None:
     env = os.environ.copy()
-    env["SID"] = session_id
+
+    try:
+        probe = subprocess.run(
+            ["docker", "compose", "ps", "--services"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        if probe.returncode != 0:
+            return None
+
+        services = {line.strip() for line in probe.stdout.splitlines() if line.strip()}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
 
     for service in _candidate_docker_services():
-        try:
-            probe = subprocess.run(
-                ["docker", "compose", "ps", "--services"],
-                capture_output=True,
-                text=True,
-                check=False,
-                env=env,
-            )
-            if probe.returncode != 0:
-                continue
-
-            services = {line.strip() for line in probe.stdout.splitlines() if line.strip()}
-            if service not in services:
-                continue
-
-            print(f"Trying tamper inside docker service: {service}")
-
-            result = subprocess.run(
-                ["docker", "compose", "exec", "-T", service, "python", tamper_script],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            return result
-        except FileNotFoundError:
-            return None
-        except Exception:
+        if service not in services:
             continue
+
+        print(f"Trying tamper inside docker service: {service}")
+
+        quoted_sid = shlex.quote(session_id)
+        quoted_script = shlex.quote(tamper_script)
+        shell_cmd = f"SID={quoted_sid} python {quoted_script}"
+
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-T", service, "sh", "-lc", shell_cmd],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result
 
     return None
 
