@@ -134,22 +134,77 @@ def verify_proof(base_url: str, auth_headers: Dict[str, str], session_id: str) -
     return verify_data
 
 
-def run_tamper_script(tamper_script: str, session_id: str) -> None:
-    print("\n== Tamper DB row ==")
+def _candidate_docker_services() -> list[str]:
+    explicit = (os.getenv("TAMPER_IN_DOCKER_SERVICE") or "").strip()
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
 
-    if not os.path.exists(tamper_script):
-        raise RuntimeError(f"Tamper script not found: {tamper_script}")
+    for name in ("qod-api", "api", "backend", "app", "web"):
+        if name not in candidates:
+            candidates.append(name)
 
+    return candidates
+
+
+def _try_docker_tamper(tamper_script: str, session_id: str) -> subprocess.CompletedProcess[str] | None:
     env = os.environ.copy()
     env["SID"] = session_id
 
-    result = subprocess.run(
-        [sys.executable, tamper_script],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    for service in _candidate_docker_services():
+        try:
+            probe = subprocess.run(
+                ["docker", "compose", "ps", "--services"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if probe.returncode != 0:
+                continue
+
+            services = {line.strip() for line in probe.stdout.splitlines() if line.strip()}
+            if service not in services:
+                continue
+
+            print(f"Trying tamper inside docker service: {service}")
+
+            result = subprocess.run(
+                ["docker", "compose", "exec", "-T", service, "python", tamper_script],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result
+        except FileNotFoundError:
+            return None
+        except Exception:
+            continue
+
+    return None
+
+
+def run_tamper_script(tamper_script: str, session_id: str) -> None:
+    print("\n== Tamper DB row ==")
+
+    result = _try_docker_tamper(tamper_script, session_id)
+
+    if result is None:
+        if not os.path.exists(tamper_script):
+            raise RuntimeError(f"Tamper script not found: {tamper_script}")
+
+        env = os.environ.copy()
+        env["SID"] = session_id
+
+        print("Falling back to local tamper script execution")
+        result = subprocess.run(
+            [sys.executable, tamper_script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     if result.stdout.strip():
         print(result.stdout.strip())
