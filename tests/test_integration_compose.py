@@ -1,137 +1,131 @@
 import json
 import os
-import subprocess
 import time
-import uuid
 import unittest
 from pathlib import Path
 
 import requests
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
-
-API_BASE = os.environ.get("QOD_API_BASE", "http://127.0.0.1:8010")
-ARTIFACTS_ROOT = REPO_ROOT / "artifacts"
-
-MAX_WAIT_SECONDS = 90
-POLL_SECONDS = 2
-
-
-def run(cmd, cwd=REPO_ROOT):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(
-            f"Command failed: {' '.join(cmd)}\n\nSTDOUT:\n{p.stdout}\n\nSTDERR:\n{p.stderr}"
-        )
-    return p.stdout
-
-
-def wait_for_health():
-    deadline = time.time() + MAX_WAIT_SECONDS
-    while time.time() < deadline:
-        try:
-            r = requests.get(API_BASE + "/health", timeout=2)
-            if r.status_code == 200:
-                return r.text
-        except Exception:
-            pass
-        time.sleep(POLL_SECONDS)
-    raise TimeoutError(f"API did not become healthy within {MAX_WAIT_SECONDS}s at {API_BASE}/health")
-
-
 class TestIntegrationCompose(unittest.TestCase):
+    BASE_URL = os.getenv("TEST_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    API_TOKEN = os.getenv("QOD_API_TOKEN", "dev-token-123")
+    ARTIFACTS_DIR = Path(os.getenv("QOD_ARTIFACTS_DIR", "artifacts"))
+
     @classmethod
     def setUpClass(cls):
-        ARTIFACTS_ROOT.mkdir(exist_ok=True)
+        cls.headers = {
+            "Authorization": f"Bearer {cls.API_TOKEN}",
+            "Content-Type": "application/json",
+        }
 
-        run(["docker", "compose", "-f", str(COMPOSE_FILE), "down", "--remove-orphans", "--volumes"])
-        run(["docker", "compose", "-f", str(COMPOSE_FILE), "build"])
-        run(["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"])
+    def _post(self, path: str, payload: dict, expected_status: int = 200):
+        r = requests.post(
+            f"{self.BASE_URL}{path}",
+            headers=self.headers,
+            json=payload,
+            timeout=30,
+        )
+        self.assertEqual(r.status_code, expected_status, r.text)
+        return r
 
-        wait_for_health()
-
-    @classmethod
-    def tearDownClass(cls):
-        # Keep compose running if debugging (so you can docker compose exec after failures)
-        if os.environ.get("KEEP_COMPOSE_UP") == "1":
-            return
-        try:
-            run(["docker", "compose", "-f", str(COMPOSE_FILE), "down", "--remove-orphans", "--volumes"])
-        except Exception:
-            pass
+    def _get(self, path: str, expected_status: int = 200):
+        r = requests.get(
+            f"{self.BASE_URL}{path}",
+            headers=self.headers,
+            timeout=30,
+        )
+        self.assertEqual(r.status_code, expected_status, r.text)
+        return r
 
     def test_end_to_end_flow_creates_proof_and_artifacts(self):
-        # 1) Create intent/session
         intent_payload = {
-            "text": "turbo qos request",
-            "target_p95_latency_ms": 200,
-            "target_jitter_ms": 20,
-            "duration_s": 30,
+            "text": "compose integration test",
+            "target_p95_latency_ms": 120,
+            "target_jitter_ms": 25,
+            "duration_s": 15,
+            "flow_label": "compose-integration",
         }
-        r = requests.post(API_BASE + "/intent", json=intent_payload, timeout=10)
-        self.assertEqual(r.status_code, 200, r.text)
-        data = r.json()
-        self.assertIn("session_id", data, f"Missing session_id. Response: {data}")
-        session_id = data["session_id"]
 
-        # Basic sanity: looks like UUID
-        uuid.UUID(session_id)
+        r = self._post("/intent", intent_payload)
+        intent_data = r.json()
 
-        # 2) Post telemetry (required)
-        telemetry_payload = {
-            "session_id": session_id,
-            "n": 100,
-            "p50_ms": 50.0,
-            "p95_ms": 120.0,
-            "jitter_ms": 10.0,
-            "notes": "integration-test",
-        }
-        t = requests.post(API_BASE + "/telemetry", json=telemetry_payload, timeout=10)
-        self.assertEqual(t.status_code, 200, t.text)
+        session_id = intent_data["session_id"]
+        self.assertTrue(session_id)
+        self.assertIn("qos_profile", intent_data)
+        self.assertIn("qos_status", intent_data)
 
-        # 3) Finalize proof
-        f = requests.post(API_BASE + f"/proof/{session_id}/finalize", timeout=10)
-        self.assertEqual(f.status_code, 200, f.text)
-        finalize_data = f.json()
-        self.assertTrue(isinstance(finalize_data, dict), f"Finalize JSON not an object: {finalize_data}")
+        telemetry_samples = [
+            {
+                "session_id": session_id,
+                "n": 100,
+                "p50_ms": 40,
+                "p95_ms": 90,
+                "jitter_ms": 10,
+                "notes": "sample-1",
+            },
+            {
+                "session_id": session_id,
+                "n": 100,
+                "p50_ms": 45,
+                "p95_ms": 110,
+                "jitter_ms": 12,
+                "notes": "sample-2",
+            },
+            {
+                "session_id": session_id,
+                "n": 100,
+                "p50_ms": 42,
+                "p95_ms": 100,
+                "jitter_ms": 11,
+                "notes": "sample-3",
+            },
+        ]
 
-        # 4) Verify proof exists via API
-        g = requests.get(API_BASE + f"/proof/{session_id}", timeout=10)
-        self.assertEqual(g.status_code, 200, g.text)
+        for sample in telemetry_samples:
+            tr = self._post("/telemetry", sample)
+            self.assertEqual(tr.json()["status"], "stored")
 
-        # 5) Verify artifacts exist on host:
-        # Your service writes flat files like:
-        #   artifacts/proof_<session_id>_<timestamp>.json
-        # not artifacts/<session_id>/artifact.json
-        deadline = time.time() + 15
-        proof_files = []
-        while time.time() < deadline:
-            proof_files = list(ARTIFACTS_ROOT.glob(f"proof_{session_id}_*.json"))
-            if proof_files:
-                break
-            time.sleep(0.5)
+        time.sleep(2.5)
 
-        if not proof_files:
-            # Dump helpful info before failing
-            try:
-                ls_host = "\n".join([p.name for p in sorted(ARTIFACTS_ROOT.glob("*"))])
-                print("\n--- host artifacts dir listing ---\n", ls_host)
+        fr = requests.post(
+            f"{self.BASE_URL}/proof/{session_id}/finalize",
+            headers={"Authorization": f"Bearer {self.API_TOKEN}"},
+            timeout=30,
+        )
+        self.assertEqual(fr.status_code, 200, fr.text)
+        final_data = fr.json()
 
-                ls_container = run(
-                    ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "qod-api",
-                     "sh", "-lc", "ls -la /app/artifacts || true"]
-                )
-                print("\n--- container /app/artifacts listing ---\n", ls_container)
-            except Exception as e:
-                print("\n(debug dump failed)", e)
+        self.assertIn("prev_hash", final_data)
+        self.assertIn("this_hash", final_data)
+        self.assertIn("signature", final_data)
+        self.assertIn("kid", final_data)
+        self.assertIn("proof", final_data)
+
+        vr = self._get(f"/proof/{session_id}/verify")
+        verify_data = vr.json()
+
+        self.assertTrue(verify_data["verified"], json.dumps(verify_data, indent=2))
+        self.assertEqual(verify_data["reason"], "ok")
+        self.assertTrue(verify_data["runtime_artifact_verified"])
+        self.assertTrue(verify_data["ledger_hash_verified"])
+        self.assertTrue(verify_data["chain_continuity_verified"])
+        self.assertTrue(verify_data["signature_verified"])
+
+        runtime_artifact_path = self.ARTIFACTS_DIR / session_id / "artifact.json"
+        wrapper_artifact_path = self.ARTIFACTS_DIR / session_id / "artifact_v1.json"
 
         self.assertTrue(
-            proof_files,
-            f"Expected at least one proof file matching proof_{session_id}_*.json in {ARTIFACTS_ROOT}"
+            runtime_artifact_path.exists(),
+            f"Missing runtime artifact: {runtime_artifact_path}",
+        )
+        self.assertTrue(
+            wrapper_artifact_path.exists(),
+            f"Missing wrapper artifact: {wrapper_artifact_path}",
         )
 
-        # Make sure each proof file is valid JSON (handle BOM)
-        for p in proof_files:
-            json.loads(p.read_text(encoding="utf-8-sig"))
+        proof_files = list(self.ARTIFACTS_DIR.glob(f"proof_{session_id}_*.json"))
+        self.assertTrue(
+            proof_files,
+            f"No proof artifact files found in {self.ARTIFACTS_DIR} for session {session_id}",
+        )
