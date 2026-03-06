@@ -37,30 +37,33 @@ from cryptography.exceptions import InvalidSignature
 
 
 # ----------------------------
-# API auth (Bearer token) - STRICT + request-time env read
+# API auth (Bearer token)
 # ----------------------------
 _auth_scheme = HTTPBearer(auto_error=False)
+
+
+def _auth_required() -> bool:
+    """
+    Auth is required unless explicitly disabled with:
+      QOD_AUTH_REQUIRED=0
+    """
+    raw = (os.getenv("QOD_AUTH_REQUIRED") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def require_api_key(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
 ) -> str:
     """
-    Require: Authorization: Bearer <token>
-
-    STRICT behavior:
-      - If QOD_API_TOKEN is set (non-empty):
-          * Missing header -> 401
-          * Wrong scheme  -> 401
-          * Wrong token   -> 401
-          * Correct token -> returns token string
-      - If QOD_API_TOKEN is NOT set:
-          * Fail closed -> 500 (prevents "auth accidentally off" confusion)
-
-    IMPORTANT:
-      - We read QOD_API_TOKEN at request-time (NOT import-time) so it works
-        reliably with uvicorn --reload and Windows reloaders.
+    Behavior:
+      - If QOD_AUTH_REQUIRED=0 -> auth bypassed
+      - If QOD_AUTH_REQUIRED=1 and QOD_API_TOKEN missing -> 500
+      - If auth required and no/wrong header -> 401
+      - If auth required and token correct -> success
     """
+    if not _auth_required():
+        return "auth-disabled"
+
     expected = (os.getenv("QOD_API_TOKEN") or "").strip()
 
     if not expected:
@@ -148,7 +151,6 @@ def _b64url_decode(s: str) -> bytes:
 
 
 def _ed25519_public_bytes_raw(pub: Ed25519PublicKey) -> bytes:
-    # cryptography has public_bytes_raw() in newer versions; keep compatibility
     raw_fn = getattr(pub, "public_bytes_raw", None)
     if callable(raw_fn):
         return raw_fn()
@@ -167,9 +169,6 @@ def _ed25519_private_bytes_raw(priv: Ed25519PrivateKey) -> bytes:
 
 
 def _load_ed25519_private_key_from_env() -> Optional[Ed25519PrivateKey]:
-    """
-    QOD_SIGNING_PRIVATE_KEY_B64URL should be base64url of 32 raw bytes.
-    """
     b64u = (os.getenv("QOD_SIGNING_PRIVATE_KEY_B64URL") or "").strip()
     if not b64u:
         return None
@@ -183,10 +182,6 @@ def _load_ed25519_private_key_from_env() -> Optional[Ed25519PrivateKey]:
 
 
 def _load_ed25519_public_key_from_env_single() -> Optional[Ed25519PublicKey]:
-    """
-    QOD_SIGNING_PUBLIC_KEY_B64URL should be base64url of 32 raw bytes.
-    If missing, we derive it from the private key.
-    """
     b64u = (os.getenv("QOD_SIGNING_PUBLIC_KEY_B64URL") or "").strip()
     if b64u:
         try:
@@ -207,20 +202,7 @@ def _active_kid() -> str:
     return (os.getenv("QOD_ACTIVE_SIGNING_KID") or "default").strip() or "default"
 
 
-# ✅ Compatibility helpers expected by tests/test_key_rotation.py
 def _parse_signing_keys(env_value: Optional[str] = None) -> Dict[str, str]:
-    """
-    Test-friendly parser.
-
-    If env_value is None, reads QOD_SIGNING_KEYS first (unit tests),
-    then falls back to QOD_PUBLIC_KEYS and friends.
-
-    Accepts:
-      - entry separators: ';' or ',' or newlines
-      - key/value separators: ':' or '='
-
-    Returns dict[kid] = value (raw string; server will validate as needed)
-    """
     if env_value is None:
         env_value = (
             os.environ.get("QOD_SIGNING_KEYS", "")
@@ -256,12 +238,6 @@ def _parse_signing_keys(env_value: Optional[str] = None) -> Dict[str, str]:
 
 
 def _parse_public_keys_to_objects(env_value: str) -> Dict[str, Ed25519PublicKey]:
-    """
-    Strict parser used by the server for real verification/JWKS.
-
-    Expects each value to be base64url of 32 raw Ed25519 public-key bytes.
-    Invalid entries are skipped.
-    """
     raw_map = _parse_signing_keys(env_value)
     out: Dict[str, Ed25519PublicKey] = {}
 
@@ -278,9 +254,6 @@ def _parse_public_keys_to_objects(env_value: str) -> Dict[str, Ed25519PublicKey]
 
 
 def _active_kid_and_key() -> Tuple[str, Ed25519PrivateKey]:
-    """
-    Returns (active_kid, private_key). Raises ValueError if missing/invalid.
-    """
     kid = _active_kid()
     priv = _load_ed25519_private_key_from_env()
     if priv is None:
@@ -289,21 +262,6 @@ def _active_kid_and_key() -> Tuple[str, Ed25519PrivateKey]:
 
 
 def hmac_signature_hex(message: str, *, kid: str = "default") -> str:
-    """
-    Test-friendly HMAC helper.
-
-    Requirements:
-      - accepts keyword-only kid=
-      - different kid => different signature for same message
-
-    Key selection precedence:
-      1) QOD_HMAC_SECRET_<KID>
-      2) QOD_HMAC_SECRET
-      3) "" (empty)
-
-    We ALWAYS incorporate the kid into key material so kid1 != kid2 even
-    when env secrets are missing.
-    """
     env_key = f"QOD_HMAC_SECRET_{(kid or 'default').upper()}"
     base_secret = os.getenv(env_key) or os.getenv("QOD_HMAC_SECRET") or ""
     key_material = f"{base_secret}|{kid or 'default'}".encode("utf-8")
@@ -316,16 +274,6 @@ def hmac_signature_hex(message: str, *, kid: str = "default") -> str:
 
 
 def _public_keys_from_env() -> Dict[str, Ed25519PublicKey]:
-    """
-    Supports key rotation:
-
-      QOD_PUBLIC_KEYS="kid1:<pub_b64url>;kid2:<pub_b64url>"
-
-    Where <pub_b64url> is base64url of the 32 raw Ed25519 public key bytes.
-
-    Fallback:
-      - If QOD_PUBLIC_KEYS is not set, uses QOD_SIGNING_PUBLIC_KEY_B64URL (or derives from private key).
-    """
     out: Dict[str, Ed25519PublicKey] = {}
 
     spec = (os.getenv("QOD_PUBLIC_KEYS") or "").strip()
@@ -369,9 +317,6 @@ def ed25519_verify(signature_b64url: str, message: bytes, pub: Ed25519PublicKey)
 
 
 def _jwks_from_public_keys(keys: Dict[str, Ed25519PublicKey]) -> Dict[str, Any]:
-    """
-    JWKS for Ed25519 = OKP keys with crv=Ed25519 and x=<public bytes b64url>.
-    """
     jwk_list: List[Dict[str, Any]] = []
     for kid, pub in sorted(keys.items(), key=lambda kv: kv[0]):
         raw = _ed25519_public_bytes_raw(pub)
@@ -407,12 +352,13 @@ except Exception:
 
 
 # ----------------------------
-# Debug endpoints (TEMP, but super useful)
+# Debug endpoints
 # ----------------------------
 @app.get("/_debug/env")
 def _debug_env() -> Dict[str, Any]:
     token = (os.getenv("QOD_API_TOKEN") or "").strip()
     return {
+        "auth_required": _auth_required(),
         "token_present": bool(token),
         "token_len": len(token),
         "pid": os.getpid(),
@@ -595,13 +541,11 @@ def _sqlite_ready() -> Optional[str]:
 
 @app.get("/health")
 def health() -> Dict[str, str]:
-    # Keep liveness public so Docker/GHA health checks don't need auth
     return {"status": "ok", "check": "liveness"}
 
 
 @app.get("/ready")
 def ready(response: Response) -> Dict[str, Any]:
-    # Readiness can also be public; it does not leak secrets
     start = time.time()
     problems: List[str] = []
 
@@ -618,9 +562,6 @@ def ready(response: Response) -> Dict[str, Any]:
     return {"status": "ok", "check": "readiness", "elapsed_ms": elapsed_ms}
 
 
-# ----------------------------
-# Public key endpoints (public)
-# ----------------------------
 @app.get("/.well-known/jwks.json")
 def jwks() -> Dict[str, Any]:
     keys = _public_keys_from_env()
@@ -709,7 +650,7 @@ def simulated_provider_current_status(created_at: float) -> str:
 
 
 # ----------------------------
-# API endpoints (protected)
+# API endpoints
 # ----------------------------
 @app.post("/intent")
 def create_intent_and_session(intent: Intent, _: str = Depends(require_api_key)) -> Dict[str, Any]:
@@ -982,9 +923,6 @@ def finalize_proof(session_id: UUID, request: Request, _: str = Depends(require_
             log.exception("Failed to write run summary")
 
 
-# ----------------------------
-# GET /proof/{session_id}
-# ----------------------------
 @app.get("/proof/{session_id}")
 def get_proof(session_id: UUID, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     sid = str(session_id)
@@ -1009,9 +947,6 @@ def get_proof(session_id: UUID, _: str = Depends(require_api_key)) -> Dict[str, 
     }
 
 
-# ----------------------------
-# GET /proof/{session_id}/bundle  (verifier-friendly single fetch)
-# ----------------------------
 @app.get("/proof/{session_id}/bundle")
 def get_proof_bundle(session_id: UUID, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     sid = str(session_id)
