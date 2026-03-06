@@ -125,16 +125,6 @@ jobs:
           mkdir -p artifacts
           chmod -R u+rwX artifacts || true
 
-      - name: Show .env (sensitive values redacted)
-        shell: bash
-        run: |
-          sed \
-            -e 's/QOD_API_TOKEN=.*/QOD_API_TOKEN=[redacted]/' \
-            -e 's/QOD_SIGNING_PRIVATE_KEY_B64URL=.*/QOD_SIGNING_PRIVATE_KEY_B64URL=[redacted]/' \
-            -e 's/QOD_SIGNING_PUBLIC_KEY_B64URL=.*/QOD_SIGNING_PUBLIC_KEY_B64URL=[redacted]/' \
-            -e 's/QOD_PUBLIC_KEYS=.*/QOD_PUBLIC_KEYS=[redacted]/' \
-            .env
-
       - name: Clean artifacts directory
         shell: bash
         run: |
@@ -208,8 +198,6 @@ jobs:
           urls = [
               f"http://127.0.0.1:{port}/health",
               f"http://localhost:{port}/health",
-              f"http://127.0.0.1:8010/health",
-              f"http://localhost:8010/health",
           ]
           last_error = None
 
@@ -238,36 +226,48 @@ jobs:
           raise SystemExit(f"API did not become ready in time on port {port}. Last error: {last_error}")
           PY
 
-      - name: Run compose integration test
+      # Legacy tests: auth OFF
+      - name: Run compose integration test (auth disabled)
         shell: bash
         env:
           TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_TOKEN: ""
         run: |
           set -euo pipefail
           python -m unittest -v tests.test_integration_compose
 
-      - name: Run unittest suite
+      - name: Run unittest suite (auth disabled)
         shell: bash
         env:
           TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_BASE: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_TOKEN: ""
         run: |
           set -euo pipefail
           python -m unittest discover -s tests -p "test*.py" -v
 
-      - name: Run Python demo flow tests
+      # Auth-specific flow tests: auth ON
+      - name: Run demo flow tests (auth enabled)
         shell: bash
+        env:
+          TEST_BASE_URL: http://127.0.0.1:${{ env.API_HOST_PORT }}
+          QOD_API_TOKEN: dev-token-123
         run: |
           set -euo pipefail
           python -m pytest test_demo_flow.py -v
 
-      - name: Run demo_flow.py good
+      - name: Run demo_flow.py good (auth enabled)
         shell: bash
+        env:
+          QOD_API_TOKEN: dev-token-123
         run: |
           set -euo pipefail
           python demo_flow.py --mode good --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
 
-      - name: Run demo_flow.py tamper
+      - name: Run demo_flow.py tamper (auth enabled)
         shell: bash
+        env:
+          QOD_API_TOKEN: dev-token-123
         run: |
           set -euo pipefail
           python demo_flow.py --mode tamper --base-url "http://127.0.0.1:${API_HOST_PORT}" --token "${QOD_API_TOKEN}"
