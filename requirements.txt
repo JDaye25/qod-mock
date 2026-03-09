@@ -1,4 +1,4 @@
-﻿annotated-doc==0.0.4
+annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1
 attrs==25.4.0
@@ -14,7 +14,7 @@ idna==3.11
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 pydantic==2.12.5
-pydantic_core==2.41.5
+pydantic_core==2.42.0
 python-dotenv==1.2.2
 PyYAML==6.0.3
 -e git+https://github.com/JDaye25/qod-mock.git@3ab24972883a50f00fc4a6b3eead81aaa179100e#egg=qod_assurance
